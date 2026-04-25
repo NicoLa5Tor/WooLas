@@ -1,8 +1,9 @@
 "use client";
 
-import { Copy, ExternalLink, Plus, Search, X } from "lucide-react";
+import { Copy, ExternalLink, ImagePlus, Plus, Search, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
+import { MediaLibraryBrowser } from "@/components/MediaLibraryBrowser";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -10,7 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/components/ui/toast";
-import { apiRequest, resolveActiveTenant, type AuthSession, withTenantPath } from "@/lib/api";
+import { apiRequest, type AuthSession, type MediaItem, resolveActiveTenant, withTenantPath } from "@/lib/api";
 
 type ProductCategory = {
   id: number;
@@ -19,7 +20,10 @@ type ProductCategory = {
 };
 
 type ProductImage = {
+  id: number;
   src: string;
+  name?: string;
+  alt?: string;
 };
 
 type ProductDimensions = {
@@ -48,8 +52,6 @@ type Product = {
   dimensions: ProductDimensions;
   categories: ProductCategory[];
   images: ProductImage[];
-  date_created?: string;
-  date_modified?: string;
 };
 
 type ProductListResponse = {
@@ -80,7 +82,7 @@ type EditorProduct = {
   width: string;
   height: string;
   categoryIds: string;
-  imageUrls: string;
+  images: ProductImage[];
 };
 
 function stripHtml(value: string | null | undefined) {
@@ -96,10 +98,6 @@ function displayPrice(product: Product) {
 
 function serializeCategoryIds(categories: ProductCategory[]) {
   return categories.map((category) => String(category.id)).join(", ");
-}
-
-function serializeImageUrls(images: ProductImage[]) {
-  return images.map((image) => image.src).filter(Boolean).join("\n");
 }
 
 function toEditorProduct(product?: Product): EditorProduct {
@@ -123,7 +121,7 @@ function toEditorProduct(product?: Product): EditorProduct {
       width: "",
       height: "",
       categoryIds: "",
-      imageUrls: ""
+      images: []
     };
   }
 
@@ -147,7 +145,7 @@ function toEditorProduct(product?: Product): EditorProduct {
     width: product.dimensions?.width ?? "",
     height: product.dimensions?.height ?? "",
     categoryIds: serializeCategoryIds(product.categories ?? []),
-    imageUrls: serializeImageUrls(product.images ?? [])
+    images: product.images ?? []
   };
 }
 
@@ -156,13 +154,6 @@ function parseCategoryIds(value: string) {
     .split(",")
     .map((item) => Number(item.trim()))
     .filter((item) => Number.isInteger(item) && item > 0);
-}
-
-function parseImageUrls(value: string) {
-  return value
-    .split(/\r?\n|,/) 
-    .map((item) => item.trim())
-    .filter(Boolean);
 }
 
 function buildPayload(product: EditorProduct) {
@@ -179,7 +170,7 @@ function buildPayload(product: EditorProduct) {
     stock_status: product.stock_status,
     weight: product.weight.trim() || null,
     categories: parseCategoryIds(product.categoryIds),
-    images: parseImageUrls(product.imageUrls),
+    images: product.images.map((image) => ({ id: image.id })),
     dimensions: {
       length: product.length.trim(),
       width: product.width.trim(),
@@ -201,6 +192,7 @@ export default function ProductsPage() {
   const [editorMode, setEditorMode] = useState<"create" | "edit">("edit");
   const [panelLoading, setPanelLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [showMediaPicker, setShowMediaPicker] = useState<"replace" | "append" | null>(null);
   const [pagination, setPagination] = useState({ total: 0, total_pages: 1 });
 
   const activeTenant = session ? resolveActiveTenant(session) : null;
@@ -296,7 +288,31 @@ export default function ProductsPage() {
     showToast(`${label} copiado`);
   };
 
-  const currentImage = selectedProduct?.imageUrls.split(/\r?\n|,/).map((item) => item.trim()).find(Boolean) ?? "";
+  const handleMediaSelect = (item: MediaItem) => {
+    if (!selectedProduct) {
+      return;
+    }
+
+    const nextImage = { id: item.id, src: item.url, name: item.filename };
+    if (showMediaPicker === "replace") {
+      setSelectedProduct({
+        ...selectedProduct,
+        images: [nextImage, ...selectedProduct.images.filter((image) => image.id !== item.id)]
+      });
+    }
+    if (showMediaPicker === "append") {
+      if (selectedProduct.images.some((image) => image.id === item.id)) {
+        showToast("Esa imagen ya está en la galería del producto", "error");
+        return;
+      }
+      setSelectedProduct({
+        ...selectedProduct,
+        images: [...selectedProduct.images, nextImage]
+      });
+    }
+    setShowMediaPicker(null);
+  };
+
   const editorSummary = useMemo(() => {
     if (!selectedProduct) {
       return [] as string[];
@@ -394,10 +410,7 @@ export default function ProductsPage() {
                     {products.map((product) => (
                       <tr key={product.id} className="cursor-pointer hover:bg-accent/40" onClick={() => void openProduct(product.id)}>
                         <td className="px-4 py-3"><div className="relative h-12 w-12 overflow-hidden rounded-md bg-accent">{product.images?.[0]?.src ? <img alt={product.name} className="h-full w-full object-cover" src={product.images[0].src} /> : null}</div></td>
-                        <td className="px-4 py-3">
-                          <div className="font-medium">{product.name}</div>
-                          <div className="text-xs text-muted-foreground">{product.categories?.map((category) => category.name).join(", ") || "Sin categoría"}</div>
-                        </td>
+                        <td className="px-4 py-3"><div className="font-medium">{product.name}</div><div className="text-xs text-muted-foreground">{product.categories?.map((category) => category.name).join(", ") || "Sin categoría"}</div></td>
                         <td className="px-4 py-3">{product.sku || "-"}</td>
                         <td className="px-4 py-3 text-muted-foreground">{product.slug || "-"}</td>
                         <td className="px-4 py-3">{displayPrice(product)}</td>
@@ -443,7 +456,7 @@ export default function ProductsPage() {
               <div className="grid gap-4 lg:grid-cols-[220px_minmax(0,1fr)]">
                 <div className="rounded-2xl border border-border bg-background/70 p-4">
                   <div className="aspect-square overflow-hidden rounded-xl bg-accent">
-                    {currentImage ? <img alt={selectedProduct.name || "Producto"} className="h-full w-full object-cover" src={currentImage} /> : null}
+                    {selectedProduct.images[0]?.src ? <img alt={selectedProduct.name || "Producto"} className="h-full w-full object-cover" src={selectedProduct.images[0].src} /> : null}
                   </div>
                   <div className="mt-4 space-y-2 text-sm text-muted-foreground">
                     {selectedProduct.id ? <div><span className="text-foreground">ID:</span> {selectedProduct.id}</div> : null}
@@ -461,8 +474,8 @@ export default function ProductsPage() {
 
                 <div className="grid gap-4 md:grid-cols-2">
                   <div className="space-y-2 md:col-span-2"><label className="text-sm font-medium">Nombre</label><Input className="h-12 rounded-xl" value={selectedProduct.name} onChange={(event) => setSelectedProduct({ ...selectedProduct, name: event.target.value })} /></div>
-                  <div className="space-y-2"><label className="text-sm font-medium">SKU</label><Input className="h-12 rounded-xl" value={selectedProduct.sku} onChange={(event) => setSelectedProduct({ ...selectedProduct, sku: event.target.value })} /></div>
-                  <div className="space-y-2"><label className="text-sm font-medium">Slug</label><Input className="h-12 rounded-xl" disabled value={selectedProduct.slug} /></div>
+                  {editorMode === "edit" ? <div className="space-y-2"><label className="text-sm font-medium">SKU</label><Input className="h-12 rounded-xl" disabled value={selectedProduct.sku} /></div> : <div className="space-y-2"><label className="text-sm font-medium">SKU</label><Input className="h-12 rounded-xl" disabled placeholder="Se definirá automáticamente" value="" /></div>}
+                  {editorMode === "edit" ? <div className="space-y-2"><label className="text-sm font-medium">Slug</label><Input className="h-12 rounded-xl" disabled value={selectedProduct.slug} /></div> : <div className="space-y-2"><label className="text-sm font-medium">Slug</label><Input className="h-12 rounded-xl" disabled placeholder="Se generará automáticamente" value="" /></div>}
                   <div className="space-y-2"><label className="text-sm font-medium">Estado</label><Select value={selectedProduct.status} onValueChange={(value) => setSelectedProduct({ ...selectedProduct, status: value as "publish" | "draft" })}><SelectTrigger className="h-12 rounded-xl"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="publish">Activo</SelectItem><SelectItem value="draft">Borrador</SelectItem></SelectContent></Select></div>
                   <div className="space-y-2"><label className="text-sm font-medium">Stock status</label><Select value={selectedProduct.stock_status} onValueChange={(value) => setSelectedProduct({ ...selectedProduct, stock_status: value as "instock" | "outofstock" | "onbackorder" })}><SelectTrigger className="h-12 rounded-xl"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="instock">En stock</SelectItem><SelectItem value="outofstock">Sin stock</SelectItem><SelectItem value="onbackorder">Sobre pedido</SelectItem></SelectContent></Select></div>
                   <div className="space-y-2"><label className="text-sm font-medium">Precio regular</label><Input className="h-12 rounded-xl" value={selectedProduct.regular_price} onChange={(event) => setSelectedProduct({ ...selectedProduct, regular_price: event.target.value })} /></div>
@@ -482,20 +495,47 @@ export default function ProductsPage() {
                 <div className="space-y-2"><label className="text-sm font-medium">Alto</label><Input className="h-12 rounded-xl" value={selectedProduct.height} onChange={(event) => setSelectedProduct({ ...selectedProduct, height: event.target.value })} /></div>
               </div>
 
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Categorías por ID</label>
-                  <Input className="h-12 rounded-xl" placeholder="77, 645, 812" value={selectedProduct.categoryIds} onChange={(event) => setSelectedProduct({ ...selectedProduct, categoryIds: event.target.value })} />
-                  <p className="text-xs text-muted-foreground">Usa IDs separados por coma. Ejemplo: `77, 645`.</p>
-                </div>
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Imágenes</label>
-                  <Textarea className="min-h-28 rounded-xl" placeholder="Una URL por línea" value={selectedProduct.imageUrls} onChange={(event) => setSelectedProduct({ ...selectedProduct, imageUrls: event.target.value })} />
-                </div>
-              </div>
-
+              <div className="space-y-2"><label className="text-sm font-medium">Categorías por ID</label><Input className="h-12 rounded-xl" placeholder="77, 645, 812" value={selectedProduct.categoryIds} onChange={(event) => setSelectedProduct({ ...selectedProduct, categoryIds: event.target.value })} /></div>
               <div className="space-y-2"><label className="text-sm font-medium">Descripción corta</label><Textarea className="min-h-28 rounded-xl" value={selectedProduct.short_description} onChange={(event) => setSelectedProduct({ ...selectedProduct, short_description: event.target.value })} /></div>
               <div className="space-y-2"><label className="text-sm font-medium">Descripción completa</label><Textarea className="min-h-40 rounded-xl" value={selectedProduct.description} onChange={(event) => setSelectedProduct({ ...selectedProduct, description: event.target.value })} /></div>
+
+              <div className="space-y-4 rounded-2xl border border-border bg-background/70 p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <div className="font-medium text-foreground">Imágenes</div>
+                    <div className="text-sm text-muted-foreground">Administra la imagen principal y la galería del producto sin borrar archivos de la biblioteca.</div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button className="rounded-xl" onClick={() => setShowMediaPicker("replace")} type="button" variant="outline">Cambiar imagen principal</Button>
+                    <Button className="rounded-xl" onClick={() => setShowMediaPicker("append")} type="button"><ImagePlus className="mr-2 h-4 w-4" />Agregar imagen a galería</Button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  {selectedProduct.images.map((image, index) => (
+                    <div key={`${image.id}-${index}`} className="overflow-hidden rounded-2xl border border-border bg-card">
+                      <div className="aspect-square overflow-hidden bg-accent">
+                        {image.src ? <img alt={image.name ?? `Imagen ${image.id}`} className="h-full w-full object-cover" src={image.src} /> : null}
+                      </div>
+                      <div className="space-y-2 p-3 text-sm">
+                        <div className="line-clamp-2 font-medium">{index === 0 ? "Imagen principal" : image.name ?? `Imagen ${image.id}`}</div>
+                        <div className="text-xs text-muted-foreground">Media ID: {image.id}</div>
+                        <div className="flex gap-2">
+                          {index !== 0 ? (
+                            <Button className="flex-1 rounded-xl" onClick={() => setSelectedProduct({ ...selectedProduct, images: [image, ...selectedProduct.images.filter((item) => item.id !== image.id)] })} size="sm" variant="outline">
+                              Hacer principal
+                            </Button>
+                          ) : null}
+                          <Button className="rounded-xl" onClick={() => setSelectedProduct({ ...selectedProduct, images: selectedProduct.images.filter((item) => item.id !== image.id) })} size="sm" variant="outline">
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                  {selectedProduct.images.length === 0 ? <div className="col-span-full rounded-2xl border border-border bg-card px-4 py-8 text-sm text-muted-foreground">Este producto no tiene imágenes asignadas todavía.</div> : null}
+                </div>
+              </div>
 
               <div className="rounded-2xl border border-border bg-background/70 p-4 text-sm text-muted-foreground">
                 <div className="font-medium text-foreground">Información útil del backup</div>
@@ -512,6 +552,22 @@ export default function ProductsPage() {
                 <Button className="rounded-xl px-6 font-semibold" disabled={saving || !activeTenant} onClick={() => void saveProduct()}>{saving ? (editorMode === "create" ? "Creando..." : "Guardando...") : editorMode === "create" ? "Crear producto" : "Guardar cambios"}</Button>
               </div>
             </div>
+          </div>
+        </>
+      ) : null}
+
+      {showMediaPicker && selectedProduct && activeTenant ? (
+        <>
+          <div className="fixed inset-0 z-[70] bg-slate-950/60 backdrop-blur-sm" onClick={() => setShowMediaPicker(null)} />
+          <div className="fixed inset-6 z-[80] overflow-y-auto rounded-3xl border border-border bg-card p-5 shadow-2xl sm:inset-10 sm:p-6">
+            <div className="mb-5 flex items-start justify-between gap-4">
+              <div>
+                <div className="text-xs uppercase tracking-[0.25em] text-muted-foreground">Galería</div>
+                <h3 className="mt-2 text-2xl font-semibold">{showMediaPicker === "replace" ? "Cambiar imagen principal" : "Agregar imagen a galería"}</h3>
+              </div>
+              <button className="rounded-xl p-2 hover:bg-accent" onClick={() => setShowMediaPicker(null)} type="button"><X className="h-5 w-5" /></button>
+            </div>
+            <MediaLibraryBrowser mode="picker" onSelect={handleMediaSelect} selectedIds={selectedProduct.images.map((image) => image.id)} tenantId={activeTenant.id} />
           </div>
         </>
       ) : null}

@@ -13,6 +13,7 @@ from core.database import SessionLocal
 from core.responses import error_response
 from routers import auth as auth_router
 from routers import backup as backup_router
+from routers import media as media_router
 from routers import products as products_router
 from routers import tenants as tenants_router
 from routers import users as users_router
@@ -73,4 +74,5 @@ app.include_router(tenants_router.router)
 app.include_router(users_router.router)
 app.include_router(users_router.admin_router)
 app.include_router(backup_router.router)
+app.include_router(media_router.router)
 app.include_router(products_router.router)

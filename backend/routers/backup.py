@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, File, UploadFile
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
@@ -18,6 +18,28 @@ router = APIRouter(prefix="/api/tenants/{tenant_id}", tags=["backup"])
 async def create_backup(context: TenantAccessContext = Depends(require_role(Role.CLIENT)), db: Session = Depends(get_db)):
     woo_service = WooCommerceService(**context.credentials)
     return success_response(await backup_service.create_backup(db, context.tenant, woo_service), status_code=201)
+
+
+@router.post("/backups/import")
+async def import_backup(
+    file: UploadFile = File(...),
+    context: TenantAccessContext = Depends(require_role(Role.CLIENT)),
+    db: Session = Depends(get_db),
+):
+    return success_response(
+        await backup_service.import_backup_file(db, context.tenant.id, file.filename, await file.read()),
+        status_code=201,
+    )
+
+
+@router.post("/backups/{backup_id}/restore")
+async def restore_backup(
+    backup_id: UUID,
+    context: TenantAccessContext = Depends(require_role(Role.CLIENT)),
+    db: Session = Depends(get_db),
+):
+    woo_service = WooCommerceService(**context.credentials)
+    return success_response(await backup_service.restore_backup(db, context.tenant, backup_id, woo_service))
 
 
 @router.get("/backups")

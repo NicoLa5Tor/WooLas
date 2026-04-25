@@ -80,24 +80,24 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <div className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(197,168,128,0.18),_transparent_30%),linear-gradient(180deg,_rgba(255,250,245,1),_rgba(246,242,236,1))] text-foreground dark:bg-[radial-gradient(circle_at_top,_rgba(251,146,60,0.12),_transparent_30%),linear-gradient(180deg,_rgba(15,23,42,1),_rgba(17,24,39,1))]">
-      <div className="flex min-h-screen">
+    <div className="min-h-screen overflow-x-hidden bg-[radial-gradient(circle_at_top,_rgba(197,168,128,0.18),_transparent_30%),linear-gradient(180deg,_rgba(255,250,245,1),_rgba(246,242,236,1))] text-foreground dark:bg-[radial-gradient(circle_at_top,_rgba(251,146,60,0.12),_transparent_30%),linear-gradient(180deg,_rgba(15,23,42,1),_rgba(17,24,39,1))]">
+      <div className="flex min-h-screen max-w-full overflow-x-hidden">
         <Sidebar isOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} session={session} />
-        <div className="flex min-h-screen min-w-0 flex-1 flex-col">
+        <div className="flex min-h-screen min-w-0 max-w-full flex-1 flex-col overflow-x-hidden lg:pl-80">
           <header className="sticky top-0 z-30 border-b border-border/70 bg-background/85 backdrop-blur lg:hidden">
             <div className="flex items-center justify-between px-4 py-3">
-              <div>
+              <div className="min-w-0">
                 <div className="text-[11px] uppercase tracking-[0.35em] text-muted-foreground">WooLas</div>
-                <div className="text-sm font-semibold">{session.tenants[0]?.name ?? session.user.username}</div>
+                <div className="truncate text-sm font-semibold">{session.tenants[0]?.name ?? session.user.username}</div>
               </div>
               <Button className="h-10 w-10 p-0" onClick={() => setSidebarOpen(true)} size="icon" variant="outline">
                 <Menu className="h-5 w-5" />
               </Button>
             </div>
           </header>
-          <main className="flex-1 overflow-y-auto">
-            <div className="min-h-screen px-4 py-5 sm:px-6 lg:px-8 lg:py-8">
-              <div className="mx-auto max-w-7xl">{children}</div>
+          <main className="flex-1 overflow-x-hidden overflow-y-auto">
+            <div className="min-h-screen max-w-full px-4 py-5 sm:px-6 lg:px-8 lg:py-8">
+              <div className="mx-auto min-w-0 max-w-7xl">{children}</div>
             </div>
           </main>
         </div>

@@ -28,6 +28,7 @@ class Settings(BaseSettings):
 
     database_url: str = Field(alias="DATABASE_URL")
     backups_dir: Path = Field(default=Path("/backups"), alias="BACKUPS_DIR")
+    media_cache_ttl_minutes: int = Field(default=15, alias="MEDIA_CACHE_TTL_MINUTES")
 
 
 @lru_cache

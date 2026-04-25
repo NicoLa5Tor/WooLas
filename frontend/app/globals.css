@@ -40,11 +40,17 @@
 html,
 body {
   min-height: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 body {
   @apply bg-background text-foreground antialiased;
   font-family: var(--font-sans);
+}
+
+#__next {
+  max-width: 100%;
 }
 
 * {

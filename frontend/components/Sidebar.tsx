@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { DatabaseBackup, FileSpreadsheet, LogOut, MoonStar, PackageSearch, ShieldCheck, SunMedium, X } from "lucide-react";
+import { DatabaseBackup, FileImage, FileSpreadsheet, LogOut, MoonStar, PackageSearch, ShieldCheck, SunMedium, X } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useEffect, useState } from "react";
 
@@ -20,6 +20,7 @@ const items: Array<{
   { href: "/backup", label: "Backup", icon: DatabaseBackup, roles: ["admin", "client"] },
   { href: "/import", label: "Importar Excel", icon: FileSpreadsheet, roles: ["admin", "client"] },
   { href: "/products", label: "Productos", icon: PackageSearch, roles: ["admin", "client"] },
+  { href: "/imagenes", label: "Imágenes", icon: FileImage, roles: ["admin", "client"] },
   { href: "/admin/users", label: "Clientes", icon: ShieldCheck, roles: ["admin"] }
 ];
 
@@ -68,13 +69,13 @@ export function Sidebar({
       />
       <aside
         className={cn(
-          "fixed inset-y-0 left-0 z-50 flex w-[88vw] max-w-sm flex-col border-r border-border bg-card/96 shadow-2xl backdrop-blur transition-transform duration-200 lg:sticky lg:top-0 lg:z-20 lg:h-screen lg:w-80 lg:translate-x-0 lg:shadow-none",
+          "fixed inset-y-0 left-0 z-50 flex w-[88vw] max-w-sm shrink-0 flex-col border-r border-border bg-card/96 shadow-2xl backdrop-blur transition-transform duration-200 lg:w-80 lg:translate-x-0 lg:shadow-none lg:fixed",
           isOpen ? "translate-x-0" : "-translate-x-full"
         )}
       >
         <div className="border-b border-border px-5 py-5 sm:px-6">
           <div className="mb-5 flex items-start justify-between lg:hidden">
-            <div>
+            <div className="min-w-0">
               <div className="text-[11px] uppercase tracking-[0.35em] text-muted-foreground">WooLas</div>
               <div className="mt-1 text-lg font-semibold">Panel principal</div>
             </div>
@@ -86,7 +87,7 @@ export function Sidebar({
           <div className="hidden text-xs uppercase tracking-[0.35em] text-muted-foreground lg:block">WooLas</div>
           <div className="mt-1 text-xl font-semibold lg:mt-3">WooCommerce Manager</div>
           <div className="mt-3 rounded-2xl border border-border bg-background/75 px-4 py-3">
-            <div className="text-sm font-medium">{session.user.username}</div>
+            <div className="truncate text-sm font-medium">{session.user.username}</div>
             <div className="mt-1 text-xs uppercase tracking-[0.22em] text-muted-foreground">{effectiveRole}</div>
           </div>
 
@@ -102,7 +103,7 @@ export function Sidebar({
                   window.location.reload();
                 }}
               >
-                <SelectTrigger className="h-12 rounded-xl bg-background/80">
+                <SelectTrigger className="h-12 w-full rounded-xl bg-background/80">
                   <SelectValue placeholder="Selecciona cliente" />
                 </SelectTrigger>
                 <SelectContent>
@@ -121,7 +122,7 @@ export function Sidebar({
           )}
         </div>
 
-        <nav className="flex-1 space-y-2 px-4 py-5 sm:px-5">
+        <nav className="flex-1 space-y-2 overflow-y-auto px-4 py-5 sm:px-5">
           {visibleItems.map((item) => {
             const Icon = item.icon;
             const active = pathname === item.href;
@@ -136,15 +137,15 @@ export function Sidebar({
                 )}
                 onClick={onClose}
               >
-                <Icon className="h-4 w-4" />
-                {item.label}
+                <Icon className="h-4 w-4 shrink-0" />
+                <span className="truncate">{item.label}</span>
               </Link>
             );
           })}
         </nav>
 
         <div className="border-t border-border px-4 py-4 sm:px-5">
-          <div className="mb-3 flex items-center justify-between rounded-2xl border border-border bg-background/80 px-4 py-3 text-sm">
+          <div className="mb-3 flex items-center justify-between gap-3 rounded-2xl border border-border bg-background/80 px-4 py-3 text-sm">
             <div className="min-w-0">
               <div className="truncate font-medium">{activeTenant?.name ?? session.user.username}</div>
               <div className="text-xs text-muted-foreground">Modo {resolvedTheme === "dark" ? "oscuro" : "claro"}</div>

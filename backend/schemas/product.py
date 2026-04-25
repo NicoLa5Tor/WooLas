@@ -1,6 +1,12 @@
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+
+class ProductImageInput(BaseModel):
+    id: int | None = None
+    src: str | None = None
 
 
 class ProductBase(BaseModel):
@@ -17,7 +23,7 @@ class ProductBase(BaseModel):
     weight: str | None = None
     type: Literal["simple"] = "simple"
     categories: list[int] = Field(default_factory=list)
-    images: list[str] = Field(default_factory=list)
+    images: list[ProductImageInput] = Field(default_factory=list)
     dimensions: dict[str, str] | None = None
 
 
@@ -38,7 +44,7 @@ class ProductUpdate(BaseModel):
     stock_status: Literal["instock", "outofstock", "onbackorder"] | None = None
     weight: str | None = None
     categories: list[int] | None = None
-    images: list[str] | None = None
+    images: list[ProductImageInput] | None = None
     dimensions: dict[str, str] | None = None
 
 

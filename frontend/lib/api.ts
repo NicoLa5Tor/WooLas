@@ -22,6 +22,8 @@ export type Tenant = {
   id: string;
   name: string;
   wc_url: string;
+  wp_user: string | null;
+  has_wp_media_credentials: boolean;
   is_active: boolean;
   created_at: string;
 };
@@ -58,6 +60,23 @@ export type AdminClient = {
   tenant_id: string;
   tenant_name: string;
   wc_url: string;
+  wp_user: string | null;
+  has_wp_media_credentials: boolean;
+};
+
+export type MediaItem = {
+  id: number;
+  url: string;
+  thumbnail: string;
+  filename: string;
+  uploaded_at: string;
+};
+
+export type MediaListResponse = {
+  items: MediaItem[];
+  page: number;
+  total_pages: number;
+  total: number;
 };
 
 type RetryCallback = (details: { attempt: number; maxAttempts: number; delayMs: number; error: Error }) => void | Promise<void>;
@@ -144,6 +163,40 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}) 
   }
 
   throw new Error("La solicitud no pudo completarse");
+}
+
+export async function uploadFileWithProgress<T>(path: string, file: File, onProgress?: (percent: number) => void) {
+  return new Promise<ApiResponse<T>>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${FRONTEND_API_PREFIX}${path}`);
+    xhr.withCredentials = true;
+
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable || !onProgress) {
+        return;
+      }
+      onProgress(Math.round((event.loaded / event.total) * 100));
+    };
+
+    xhr.onload = () => {
+      try {
+        const payload = JSON.parse(xhr.responseText) as ApiResponse<T>;
+        if (xhr.status < 200 || xhr.status >= 300 || !payload.success) {
+          reject(new Error(payload.error ?? "La subida falló"));
+          return;
+        }
+        resolve(payload);
+      } catch {
+        reject(new Error("Respuesta inesperada del servidor"));
+      }
+    };
+
+    xhr.onerror = () => reject(new Error("Error de red durante la subida"));
+
+    const formData = new FormData();
+    formData.append("file", file);
+    xhr.send(formData);
+  });
 }
 
 export async function getCurrentUser(cookieHeader?: string) {

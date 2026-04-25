@@ -11,7 +11,7 @@ from models.user import Role, User
 from repositories import tenant as tenant_repository
 from repositories import user as user_repository
 from services import backup as backup_service
-from services.tenant import get_decrypted_credentials
+from services.tenant import get_decrypted_credentials, get_decrypted_wp_credentials
 
 
 def get_db():
@@ -55,6 +55,7 @@ class TenantAccessContext:
     tenant: Tenant
     membership: UserTenant | None
     credentials: dict[str, str]
+    wp_credentials: dict[str, str] | None = None
     backup_record: object | None = None
 
 
@@ -74,12 +75,17 @@ def get_tenant_context(
     if membership is not None and membership.role == Role.SUPERADMIN:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid tenant membership role")
 
+    wp_credentials = None
+    if tenant.wp_user and tenant.wp_app_password:
+        wp_credentials = get_decrypted_wp_credentials(tenant)
+
     return TenantAccessContext(
         db=db,
         user=current_user,
         tenant=tenant,
         membership=membership,
         credentials=get_decrypted_credentials(tenant),
+        wp_credentials=wp_credentials,
         backup_record=None,
     )
 

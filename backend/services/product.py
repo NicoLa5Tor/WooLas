@@ -75,7 +75,16 @@ def _build_wc_payload(payload: ProductCreate | ProductUpdate):
     if "categories" in values:
         values["categories"] = [{"id": category_id} for category_id in values["categories"]]
     if "images" in values:
-        values["images"] = [{"src": image} for image in values["images"] if image]
+        mapped_images: list[dict] = []
+        for image in values["images"]:
+            image_payload: dict = {}
+            if image.get("id") is not None:
+                image_payload["id"] = image["id"]
+            elif image.get("src"):
+                image_payload["src"] = image["src"]
+            if image_payload:
+                mapped_images.append(image_payload)
+        values["images"] = mapped_images
     if "dimensions" in values and values["dimensions"] is not None:
         dimensions = values["dimensions"]
         values["dimensions"] = {
@@ -97,6 +106,7 @@ async def create_product(*, payload: ProductCreate, backup_record, db, woo_servi
 
 async def update_product(*, product_id: int, payload: ProductUpdate, backup_record, db, woo_service):
     update_payload = _build_wc_payload(payload)
+    update_payload.pop("sku", None)
     if not update_payload:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No product fields were provided")
     updated_product = await woo_service.update_product(product_id, update_payload)

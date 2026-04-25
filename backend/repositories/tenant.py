@@ -28,6 +28,8 @@ def create_tenant(
     wc_url: str,
     wc_key: str,
     wc_secret: str,
+    wp_user: str | None = None,
+    wp_app_password: str | None = None,
     is_active: bool = True,
 ) -> Tenant:
     tenant = Tenant(
@@ -35,6 +37,8 @@ def create_tenant(
         wc_url=wc_url,
         wc_key=wc_key,
         wc_secret=wc_secret,
+        wp_user=wp_user,
+        wp_app_password=wp_app_password,
         is_active=is_active,
     )
     db.add(tenant)

@@ -47,6 +47,8 @@ class AdminClientCreate(BaseModel):
     wc_url: str
     wc_key: str
     wc_secret: str
+    wp_user: str | None = None
+    wp_app_password: str | None = None
     is_active: bool = True
 
 
@@ -59,6 +61,8 @@ class AdminClientUpdate(BaseModel):
     wc_url: str | None = None
     wc_key: str | None = None
     wc_secret: str | None = None
+    wp_user: str | None = None
+    wp_app_password: str | None = None
 
 
 class AdminClientRead(BaseModel):
@@ -72,3 +76,5 @@ class AdminClientRead(BaseModel):
     tenant_id: UUID
     tenant_name: str
     wc_url: str
+    wp_user: str | None = None
+    has_wp_media_credentials: bool = False

@@ -5,8 +5,8 @@ from core.security import hash_password
 from models.user import Role
 from repositories import tenant as tenant_repository
 from repositories import user as user_repository
-from services import tenant as tenant_service
 from schemas.user import AdminClientCreate, AdminClientRead, AdminClientUpdate, UserCreate, UserRead, UserTenantMembershipRead, UserUpdate
+from services import tenant as tenant_service
 
 
 def _serialize_user_with_membership(user, membership) -> dict:
@@ -101,6 +101,8 @@ def _serialize_admin_client(user, membership, tenant) -> dict:
         tenant_id=tenant.id,
         tenant_name=tenant.name,
         wc_url=tenant.wc_url,
+        wp_user=tenant.wp_user,
+        has_wp_media_credentials=bool(tenant.wp_user and tenant.wp_app_password),
     ).model_dump(mode="json")
 
 
@@ -124,6 +126,8 @@ def create_admin_client(db: Session, payload: AdminClientCreate) -> dict:
         wc_url=payload.wc_url,
         wc_key=payload.wc_key,
         wc_secret=payload.wc_secret,
+        wp_user=payload.wp_user,
+        wp_app_password=payload.wp_app_password,
         is_active=payload.is_active,
     )
     user = user_repository.create_user(
@@ -176,6 +180,10 @@ def update_admin_client(db: Session, user_id, payload: AdminClientUpdate) -> dic
         tenant.wc_key = tenant_service.encrypt_secret(payload.wc_key)
     if payload.wc_secret is not None:
         tenant.wc_secret = tenant_service.encrypt_secret(payload.wc_secret)
+    if payload.wp_user is not None:
+        tenant.wp_user = payload.wp_user
+    if payload.wp_app_password is not None:
+        tenant.wp_app_password = tenant_service.encrypt_secret(payload.wp_app_password) if payload.wp_app_password else None
 
     user_repository.update_user(db, user)
     user_repository.update_user_tenant_membership(db, membership)

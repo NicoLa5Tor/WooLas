@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: "IBM Plex Sans", "Aptos", "Segoe UI", sans-serif;
+  --background: 38 33% 97%;
+  --foreground: 220 19% 12%;
+  --card: 0 0% 100%;
+  --card-foreground: 220 19% 12%;
+  --border: 32 18% 84%;
+  --input: 32 18% 84%;
+  --primary: 16 65% 40%;
+  --primary-foreground: 38 33% 97%;
+  --muted: 34 27% 92%;
+  --muted-foreground: 220 10% 36%;
+  --accent: 35 25% 90%;
+  --accent-foreground: 220 19% 14%;
+  --destructive: 0 73% 45%;
+  --destructive-foreground: 0 0% 100%;
+}
+
+.dark {
+  --background: 220 25% 10%;
+  --foreground: 40 20% 94%;
+  --card: 220 20% 14%;
+  --card-foreground: 40 20% 94%;
+  --border: 218 15% 24%;
+  --input: 218 15% 24%;
+  --primary: 26 74% 57%;
+  --primary-foreground: 220 25% 10%;
+  --muted: 218 18% 18%;
+  --muted-foreground: 35 12% 72%;
+  --accent: 218 18% 20%;
+  --accent-foreground: 40 20% 94%;
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 0 0% 100%;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  @apply bg-background text-foreground antialiased;
+  font-family: var(--font-sans);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--border)) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: hsl(var(--border));
+  border-radius: 9999px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}

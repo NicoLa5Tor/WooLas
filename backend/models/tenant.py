@@ -25,6 +25,7 @@ class Tenant(Base):
 
     user_memberships = relationship("UserTenant", back_populates="tenant", cascade="all, delete-orphan")
     backups = relationship("BackupRecord", back_populates="tenant", cascade="all, delete-orphan")
+    import_draft = relationship("ImportDraft", back_populates="tenant", cascade="all, delete-orphan", uselist=False)
 
 
 class UserTenant(Base):

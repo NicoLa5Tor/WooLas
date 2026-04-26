@@ -27,6 +27,7 @@ services:
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://woolas:woolas@postgres:5432/woolas}
       BACKUPS_DIR: /backups
+      IMPORTS_DIR: /data/imports
     ports:
       - "8000:8000"
     depends_on:
@@ -40,6 +41,7 @@ services:
       start_period: 5s
     volumes:
       - ./backend:/app
+      - data:/data
 
   frontend:
     build:
@@ -61,3 +63,4 @@ services:
 
 volumes:
   postgres_data:
+  data:

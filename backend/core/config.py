@@ -28,6 +28,7 @@ class Settings(BaseSettings):
 
     database_url: str = Field(alias="DATABASE_URL")
     backups_dir: Path = Field(default=Path("/backups"), alias="BACKUPS_DIR")
+    imports_dir: Path = Field(default=Path("/data/imports"), alias="IMPORTS_DIR")
     media_cache_ttl_minutes: int = Field(default=15, alias="MEDIA_CACHE_TTL_MINUTES")
 
 
@@ -38,6 +39,7 @@ def get_settings() -> Settings:
 
 def ensure_storage_dirs() -> None:
     settings.backups_dir.mkdir(parents=True, exist_ok=True)
+    settings.imports_dir.mkdir(parents=True, exist_ok=True)
 
 
 settings = get_settings()

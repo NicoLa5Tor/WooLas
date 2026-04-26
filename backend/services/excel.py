@@ -8,14 +8,87 @@ from schemas.product import PreviewRow, UpdateSummary
 
 
 ALLOWED_FIELDS = {
+    "name",
+    "slug",
+    "sku",
+    "type",
+    "status",
+    "featured",
+    "catalog_visibility",
     "regular_price",
     "sale_price",
-    "stock_quantity",
-    "name",
+    "date_on_sale_from",
+    "date_on_sale_to",
     "description",
     "short_description",
-    "status",
+    "manage_stock",
+    "stock_quantity",
+    "stock_status",
+    "backorders",
+    "sold_individually",
+    "low_stock_amount",
+    "weight",
+    "shipping_class",
+    "virtual",
+    "downloadable",
+    "download_limit",
+    "download_expiry",
 }
+
+HEADER_ALIASES = {
+    "ID del producto": "product_id",
+    "SKU": "sku",
+    "Nombre": "name",
+    "Slug": "slug",
+    "Tipo": "type",
+    "Estado": "status",
+    "Destacado": "featured",
+    "Visibilidad catalogo": "catalog_visibility",
+    "Precio regular": "regular_price",
+    "Precio oferta": "sale_price",
+    "Oferta desde": "date_on_sale_from",
+    "Oferta hasta": "date_on_sale_to",
+    "Descripcion completa": "description",
+    "Descripcion corta": "short_description",
+    "Gestionar stock": "manage_stock",
+    "Cantidad stock": "stock_quantity",
+    "Estado stock": "stock_status",
+    "Backorders": "backorders",
+    "Venta individual": "sold_individually",
+    "Alerta stock bajo": "low_stock_amount",
+    "Peso": "weight",
+    "Largo": "length",
+    "Ancho": "width",
+    "Alto": "height",
+    "Clase de envio": "shipping_class",
+    "Virtual": "virtual",
+    "Descargable": "downloadable",
+    "ID imagen principal": "image_principal_id",
+    "IDs galeria": "image_galeria_ids",
+    "Nombres imagenes": "image_nombres",
+    "Atributo 1 nombre": "attr1_nombre",
+    "Atributo 1 valores": "attr1_valores",
+    "Atributo 2 nombre": "attr2_nombre",
+    "Atributo 2 valores": "attr2_valores",
+    "IDs categorias": "category_ids",
+    "IDs etiquetas": "tag_ids",
+    "IDs upsells": "upsell_ids",
+    "IDs cross-sells": "cross_sell_ids",
+    "Meta key": "meta_key",
+    "Meta value": "meta_value",
+}
+TEMPLATE_SAMPLE_MARKERS = {
+    "product_id": "12345",
+    "sku": "03330154",
+    "name": "Producto ejemplo",
+}
+
+
+def _normalize_header(header: object) -> str:
+    value = "" if header is None else str(header).strip()
+    if value.startswith("* "):
+        value = value[2:].strip()
+    return HEADER_ALIASES.get(value, value)
 
 
 def parse_excel(file_bytes: bytes) -> tuple[list[str], list[dict[str, str]]]:
@@ -25,16 +98,19 @@ def parse_excel(file_bytes: bytes) -> tuple[list[str], list[dict[str, str]]]:
     if not rows:
         return [], []
 
-    headers = [str(value).strip() if value is not None else "" for value in rows[0]]
+    header_row_index = 2 if len(rows) >= 3 and any(str(value).strip() for value in rows[2] if value is not None) else 0
+    headers = [_normalize_header(value) for value in rows[header_row_index]]
     parsed_rows: list[dict[str, str]] = []
 
-    for row in rows[1:]:
+    for row in rows[header_row_index + 1 :]:
         parsed_row: dict[str, str] = {}
         for index, header in enumerate(headers):
             if not header:
                 continue
             value = row[index] if index < len(row) else None
             parsed_row[header] = "" if value is None else str(value)
+        if all(parsed_row.get(key, "") == value for key, value in TEMPLATE_SAMPLE_MARKERS.items()):
+            continue
         if any(value != "" for value in parsed_row.values()):
             parsed_rows.append(parsed_row)
 
@@ -49,12 +125,14 @@ def validate_mapping(headers: list[str], id_column: str, value_column: str, wc_f
 
 
 def normalize_field_value(field: str, value: str):
-    if field == "stock_quantity":
+    if field in {"stock_quantity", "low_stock_amount", "download_limit", "download_expiry"}:
         return int(float(value)) if value != "" else 0
     if field in {"regular_price", "sale_price"}:
         return str(value)
     if field == "status":
         return "draft" if str(value).strip().lower() in {"draft", "borrador", "inactive"} else "publish"
+    if field in {"featured", "manage_stock", "sold_individually", "virtual", "downloadable"}:
+        return str(value).strip().lower() in {"1", "true", "yes", "si", "sí", "y"}
     return value
 
 

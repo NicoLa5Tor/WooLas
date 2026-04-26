@@ -6,6 +6,7 @@ from sqlalchemy import engine_from_config, pool
 from core.config import settings
 from core.database import Base
 import models.backup  # noqa: F401
+import models.import_draft  # noqa: F401
 import models.media_cache  # noqa: F401
 import models.tenant  # noqa: F401
 import models.user  # noqa: F401

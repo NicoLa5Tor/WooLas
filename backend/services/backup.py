@@ -94,22 +94,60 @@ def _build_restore_payload(product: dict) -> dict:
     payload = {
         "id": int(product["id"]),
         "name": product.get("name"),
+        "slug": product.get("slug") or "",
+        "type": product.get("type") or "simple",
         "regular_price": product.get("regular_price") or "",
         "sale_price": product.get("sale_price") or "",
+        "date_on_sale_from": product.get("date_on_sale_from"),
+        "date_on_sale_to": product.get("date_on_sale_to"),
         "description": product.get("description") or "",
         "short_description": product.get("short_description") or "",
         "status": product.get("status") or "publish",
+        "featured": bool(product.get("featured")),
+        "catalog_visibility": product.get("catalog_visibility") or "visible",
         "manage_stock": bool(product.get("manage_stock")),
         "stock_quantity": product.get("stock_quantity"),
         "stock_status": product.get("stock_status") or "instock",
+        "backorders": product.get("backorders") or "no",
+        "sold_individually": bool(product.get("sold_individually")),
+        "low_stock_amount": product.get("low_stock_amount"),
         "weight": product.get("weight") or "",
         "dimensions": {
             "length": str((product.get("dimensions") or {}).get("length") or ""),
             "width": str((product.get("dimensions") or {}).get("width") or ""),
             "height": str((product.get("dimensions") or {}).get("height") or ""),
         },
+        "shipping_class": product.get("shipping_class") or "",
+        "virtual": bool(product.get("virtual")),
+        "downloadable": bool(product.get("downloadable")),
         "categories": [{"id": int(category["id"])} for category in product.get("categories", []) if category.get("id")],
+        "tags": [{"id": int(tag["id"])} for tag in product.get("tags", []) if tag.get("id")],
         "images": [{"id": int(image["id"])} for image in product.get("images", []) if image.get("id")],
+        "attributes": [
+            {
+                **({"id": int(attribute["id"])} if attribute.get("id") else {}),
+                **({"name": attribute.get("name")} if attribute.get("name") else {}),
+                "position": int(attribute.get("position") or 0),
+                "visible": bool(attribute.get("visible", True)),
+                "variation": bool(attribute.get("variation", False)),
+                "options": [str(option) for option in attribute.get("options", []) if str(option).strip()],
+            }
+            for attribute in product.get("attributes", [])
+        ],
+        "upsell_ids": [int(item) for item in product.get("upsell_ids", []) if str(item).isdigit()],
+        "cross_sell_ids": [int(item) for item in product.get("cross_sell_ids", []) if str(item).isdigit()],
+        "downloads": [
+            {"name": str(download.get("name") or ""), "file": str(download.get("file") or "")}
+            for download in product.get("downloads", [])
+            if download.get("name") and download.get("file")
+        ],
+        "download_limit": product.get("download_limit"),
+        "download_expiry": product.get("download_expiry"),
+        "meta_data": [
+            {"key": str(meta.get("key") or ""), "value": meta.get("value")}
+            for meta in product.get("meta_data", [])
+            if str(meta.get("key") or "").strip()
+        ],
     }
     if not payload["manage_stock"]:
         payload["stock_quantity"] = None

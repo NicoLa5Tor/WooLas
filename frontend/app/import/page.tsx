@@ -1,24 +1,25 @@
 "use client";
 
-import { Download, FileSpreadsheet, Trash2, UploadCloud } from "lucide-react";
+import { Check, Copy, Download, ExternalLink, FileSpreadsheet, LoaderCircle, Trash2, UploadCloud, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/components/ui/toast";
 import { apiRequest, FRONTEND_API_PREFIX, resolveActiveTenant, type AuthSession, uploadFileWithProgress, withTenantPath } from "@/lib/api";
 
 type PreviewResponse = {
   headers: string[];
   preview_rows: Array<{
+    row_index: number;
     identifier: string;
-    current_value: string | number | null;
-    new_value: string;
     product_found: boolean;
     product_id: number | null;
     product_name: string | null;
+    changed_fields: string[];
+    changes: Array<{ field: string; before: string; after: string }>;
+    row_data: Record<string, string>;
   }>;
   sample_rows: Array<Record<string, string>>;
   total_rows: number;
@@ -29,6 +30,34 @@ type UpdateResponse = {
   failed: number;
   errors: Array<{ identifier: string; error: string }>;
   total_rows: number;
+  images_job?: { job_id: string } | null;
+};
+
+type ImportImagesJobStatus = {
+  job_id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  stage: "pending" | "indexing" | "preparing" | "updating" | "completed" | "failed";
+  progress: number;
+  prepared: number;
+  processed: number;
+  total: number;
+  current_identifier: string | null;
+  current_product_name: string | null;
+  rows: Array<{
+    row_index: number;
+    identifier: string;
+    product_id: number | null;
+    product_name: string | null;
+    status: "pending" | "running" | "completed" | "failed";
+    error: string | null;
+  }>;
+  result: {
+    updated: number;
+    failed: number;
+    errors: Array<{ identifier: string; error: string }>;
+    total_rows: number;
+  } | null;
+  error: string | null;
 };
 
 type ImportDraft = {
@@ -37,15 +66,24 @@ type ImportDraft = {
   original_filename: string;
   headers: string[];
   sample_rows: Array<Record<string, string>>;
+  source_headers: string[];
   row_count: number;
   created_at: string;
   updated_at: string;
+  format_analysis: {
+    status: "ready" | "typos" | "refactor_required";
+    source_headers: string[];
+    normalized_headers: string[];
+    typo_suggestions: Array<{ provided: string; expected: string; confidence: number }>;
+    missing_required: string[];
+    unknown_headers: string[];
+    expected_fields: Array<{ key: string; label: string; required: boolean }>;
+  };
 };
 
-const wcFields = [
+const editableFields = [
   "name",
   "slug",
-  "sku",
   "type",
   "status",
   "featured",
@@ -63,11 +101,23 @@ const wcFields = [
   "sold_individually",
   "low_stock_amount",
   "weight",
+  "length",
+  "width",
+  "height",
   "shipping_class",
   "virtual",
   "downloadable",
-  "download_limit",
-  "download_expiry"
+  "images",
+  "attr1_nombre",
+  "attr1_valores",
+  "attr2_nombre",
+  "attr2_valores",
+  "category_ids",
+  "tag_ids",
+  "upsell_ids",
+  "cross_sell_ids",
+  "meta_key",
+  "meta_value"
 ];
 
 const fieldLabels: Record<string, string> = {
@@ -98,9 +148,7 @@ const fieldLabels: Record<string, string> = {
   shipping_class: "Clase de envio",
   virtual: "Virtual",
   downloadable: "Descargable",
-  image_principal_id: "ID imagen principal",
-  image_galeria_ids: "IDs galeria",
-  image_nombres: "Nombres imagenes",
+  images: "Imágenes",
   attr1_nombre: "Atributo 1 nombre",
   attr1_valores: "Atributo 1 valores",
   attr2_nombre: "Atributo 2 nombre",
@@ -111,6 +159,10 @@ const fieldLabels: Record<string, string> = {
   cross_sell_ids: "IDs cross-sells",
   meta_key: "Meta key",
   meta_value: "Meta value"
+};
+
+const fieldGroups: Record<string, string[]> = {
+  images: ["image_principal_id", "image_galeria_ids", "image_nombres"]
 };
 
 async function downloadFile(path: string, fallbackFilename: string) {
@@ -139,10 +191,7 @@ export default function ImportPage() {
   const { showToast } = useToast();
   const [session, setSession] = useState<AuthSession | null>(null);
   const [draft, setDraft] = useState<ImportDraft | null>(null);
-  const [idColumn, setIdColumn] = useState("");
-  const [valueColumn, setValueColumn] = useState("");
-  const [identifierType, setIdentifierType] = useState<"sku" | "product_id">("sku");
-  const [wcField, setWcField] = useState("regular_price");
+  const [selectedFields, setSelectedFields] = useState<string[]>([]);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [result, setResult] = useState<UpdateResponse | null>(null);
   const [loadingPreview, setLoadingPreview] = useState(false);
@@ -154,11 +203,113 @@ export default function ImportPage() {
   const intervalRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [isColumnModalOpen, setIsColumnModalOpen] = useState(false);
+  const [selectedPreviewRowIndexes, setSelectedPreviewRowIndexes] = useState<number[]>([]);
+  const [selectedPreviewRow, setSelectedPreviewRow] = useState<PreviewResponse["preview_rows"][number] | null>(null);
+  const [applyStatusMessage, setApplyStatusMessage] = useState<string | null>(null);
+  const [applyStatusDetail, setApplyStatusDetail] = useState<string | null>(null);
+  const [applyStatusError, setApplyStatusError] = useState<string | null>(null);
+  const [showApplyStatusModal, setShowApplyStatusModal] = useState(false);
+  const [imagesJobStatus, setImagesJobStatus] = useState<ImportImagesJobStatus | null>(null);
 
   const previewColumns = useMemo(() => draft?.headers.filter(Boolean) ?? [], [draft]);
   const sampleRows = draft?.sample_rows ?? [];
   const headers = draft?.headers ?? [];
+  const formatAnalysis = draft?.format_analysis ?? null;
   const activeTenant = session ? resolveActiveTenant(session) : null;
+  const availableEditableFields = useMemo(
+    () => editableFields.filter((field) => (fieldGroups[field] ?? [field]).every((column) => previewColumns.includes(column))),
+    [previewColumns]
+  );
+  const selectedFieldLabels = useMemo(() => selectedFields.map((field) => fieldLabels[field] ?? field), [selectedFields]);
+  const selectedFieldsSummary = useMemo(() => {
+    if (selectedFields.length === 0) {
+      return "";
+    }
+    return selectedFields.map((field) => fieldLabels[field] ?? field).join(", ");
+  }, [selectedFields]);
+  const claudePrompt = useMemo(() => {
+    if (!formatAnalysis) {
+      return "";
+    }
+
+    const suggestions = formatAnalysis.typo_suggestions.map((item) => `- Corrige "${item.provided}" por "${item.expected}"`).join("\n");
+    const required = formatAnalysis.missing_required.map((item) => `- ${item}`).join("\n");
+    const unknown = formatAnalysis.unknown_headers.map((item) => `- ${item}`).join("\n");
+
+    return [
+      "Necesito que conviertas un Excel de productos al formato exacto que usa mi sistema interno para importar productos WooCommerce.",
+      "",
+      "Contexto:",
+      "- Mi sistema administra productos WooCommerce.",
+      "- El objetivo es tomar un Excel de origen del usuario y devolver un nuevo Excel compatible con el formato oficial de importación.",
+      "- Te voy a adjuntar 2 archivos:",
+      "  1. El Excel del usuario que hay que transformar.",
+      "  2. El Excel plantilla/formato oficial que debes usar como referencia de estructura, columnas y estilo.",
+      "",
+      "Tu tarea:",
+      "- Analiza el Excel del usuario.",
+      "- Analiza la plantilla oficial.",
+      "- Devuélveme un nuevo Excel siguiendo el formato oficial.",
+      "- Debes mapear las columnas del Excel del usuario hacia las columnas de la plantilla.",
+      "- Si un encabezado está mal escrito pero claramente corresponde a una columna del formato oficial, corrígelo.",
+      "- Si faltan columnas obligatorias, créalas y déjalas vacías.",
+      "- Si hay columnas extra que no sirven para el formato oficial, puedes ignorarlas.",
+      "- Conserva toda la información útil del archivo del usuario.",
+      "- No me devuelvas una explicación: devuélveme el archivo resultante listo para importar.",
+      "",
+      "Reglas importantes:",
+      "- Usa como salida el formato de la plantilla oficial, no inventes otra estructura.",
+      "- Mantén los nombres de columnas exactamente como aparecen en la plantilla.",
+      "- Si una descripción viene en HTML, conviértela a texto legible en el Excel de salida.",
+      "- Si hay listas múltiples, usa el separador que define la plantilla.",
+      "- Si no puedes inferir un valor, déjalo vacío en vez de inventarlo.",
+      "",
+      "Columnas esperadas y significado:",
+      "- ID del producto: ID numérico del producto en WooCommerce.",
+      "- SKU: código único del producto.",
+      "- Nombre: nombre comercial del producto.",
+      "- Slug: identificador SEO.",
+      "- Tipo: simple, variable, grouped o external.",
+      "- Estado: publish, draft, pending o private.",
+      "- Destacado: true o false.",
+      "- Visibilidad catalogo: visible, catalog, search o hidden.",
+      "- Precio regular: precio base.",
+      "- Precio oferta: precio rebajado.",
+      "- Oferta desde: fecha inicio de oferta en ISO 8601.",
+      "- Oferta hasta: fecha fin de oferta en ISO 8601.",
+      "- Descripcion completa: texto largo del producto.",
+      "- Descripcion corta: resumen corto del producto.",
+      "- Gestionar stock: true o false.",
+      "- Cantidad stock: cantidad disponible.",
+      "- Estado stock: instock, outofstock u onbackorder.",
+      "- Backorders: no, notify o yes.",
+      "- Venta individual: true o false.",
+      "- Alerta stock bajo: umbral de alerta.",
+      "- Peso: peso del producto.",
+      "- Largo, Ancho, Alto: dimensiones.",
+      "- Clase de envio: slug de clase de envío.",
+      "- Virtual: true o false.",
+      "- Descargable: true o false.",
+      "- Imágenes: grupo que representa la imagen principal, la galería y los nombres de referencia.",
+      "- Atributo 1 nombre / valores: primer atributo y sus valores.",
+      "- Atributo 2 nombre / valores: segundo atributo y sus valores.",
+      "- IDs categorias: IDs de categorías separadas según plantilla.",
+      "- IDs etiquetas: IDs de etiquetas separadas según plantilla.",
+      "- IDs upsells: productos recomendados en producto.",
+      "- IDs cross-sells: productos recomendados en carrito.",
+      "- Meta key / Meta value: campos personalizados.",
+      "",
+      suggestions ? `Sugerencias detectadas por mi sistema:\n${suggestions}` : "",
+      required ? `Columnas obligatorias faltantes detectadas:\n${required}` : "",
+      unknown ? `Columnas no reconocidas detectadas:\n${unknown}` : "",
+      "",
+      "Salida esperada:",
+      "- Un archivo Excel nuevo.",
+      "- Debe conservar la estructura de la plantilla oficial.",
+      "- Debe quedar listo para importar directamente en mi sistema.",
+    ].filter(Boolean).join("\n");
+  }, [formatAnalysis]);
 
   const loadCurrentDraft = async (tenantId: string) => {
     try {
@@ -167,14 +318,8 @@ export default function ImportPage() {
       setDraft(currentDraft);
       setPreview(null);
       setResult(null);
-      if (currentDraft) {
-        const nextHeaders = currentDraft.headers.filter(Boolean);
-        setIdColumn((current) => current || (nextHeaders.includes("sku") ? "sku" : nextHeaders[0] ?? ""));
-        setValueColumn((current) => current || (nextHeaders.includes("regular_price") ? "regular_price" : nextHeaders[1] ?? nextHeaders[0] ?? ""));
-      } else {
-        setIdColumn("");
-        setValueColumn("");
-      }
+      setSelectedFields([]);
+      setSelectedPreviewRowIndexes([]);
     } catch (err) {
       const message = err instanceof Error ? err.message : "No se pudo cargar el Excel guardado";
       setError(message);
@@ -218,9 +363,8 @@ export default function ImportPage() {
     try {
       const response = await uploadFileWithProgress<ImportDraft>(withTenantPath(activeTenant.id, "/imports"), selectedFile, setUploadProgress);
       setDraft(response.data);
-      const nextHeaders = response.data.headers.filter(Boolean);
-      setIdColumn(nextHeaders.includes("sku") ? "sku" : nextHeaders[0] ?? "");
-      setValueColumn(nextHeaders.includes("regular_price") ? "regular_price" : nextHeaders[1] ?? nextHeaders[0] ?? "");
+      setSelectedFields([]);
+      setSelectedPreviewRowIndexes([]);
       showToast("Excel guardado en la sesión actual");
     } catch (err) {
       const message = err instanceof Error ? err.message : "No se pudo guardar el Excel";
@@ -243,11 +387,12 @@ export default function ImportPage() {
     if (!draft) {
       throw new Error("Primero guarda un archivo Excel en la sesión");
     }
+    if (selectedFields.length === 0) {
+      throw new Error("Selecciona al menos una columna para editar");
+    }
     const formData = new FormData();
-    formData.append("id_column", idColumn);
-    formData.append("value_column", valueColumn);
-    formData.append("id_type", identifierType);
-    formData.append("wc_field", wcField);
+    formData.append("selected_fields", JSON.stringify(selectedFields));
+    formData.append("selected_row_indexes", JSON.stringify(selectedPreviewRowIndexes));
     return { tenantPath: withTenantPath(activeTenant.id, "/imports"), formData };
   };
 
@@ -259,6 +404,7 @@ export default function ImportPage() {
       const { tenantPath, formData } = buildFormData();
       const response = await apiRequest<PreviewResponse>(`${tenantPath}/preview`, { method: "POST", body: formData });
       setPreview(response.data);
+      setSelectedPreviewRowIndexes(response.data.preview_rows.filter((row) => row.product_found).map((row) => row.row_index));
     } catch (err) {
       const message = err instanceof Error ? err.message : "No se pudo generar la vista previa";
       setError(message);
@@ -269,28 +415,175 @@ export default function ImportPage() {
   };
 
   const handleApply = async () => {
+    let hasError = false;
+    let hasImagesJob = false;
     setLoadingApply(true);
     setError(null);
     setResult(null);
+    setApplyStatusError(null);
+    setImagesJobStatus(null);
+    setShowApplyStatusModal(true);
     setProgress(8);
-    intervalRef.current = window.setInterval(() => setProgress((current) => (current >= 90 ? current : current + 7)), 400);
+    setApplyStatusMessage(selectedFields.includes("images") ? "Editando imágenes desde el Excel..." : "Aplicando cambios del Excel...");
+    setApplyStatusDetail(
+      selectedFields.includes("images")
+        ? `Resolviendo imágenes y preparando ${selectedPreviewRowIndexes.length} producto(s) para actualización masiva.`
+        : `Preparando ${selectedPreviewRowIndexes.length} producto(s) con estas columnas: ${selectedFieldsSummary}`
+    );
+    intervalRef.current = window.setInterval(() => {
+      setProgress((current) => {
+        if (current >= 90) {
+          return current;
+        }
+        if (current >= 55) {
+          setApplyStatusMessage(selectedFields.includes("images") ? "Buscando coincidencias de imágenes en la media library..." : "Enviando cambios al backend...");
+          setApplyStatusDetail(
+            selectedFields.includes("images")
+              ? "Se están resolviendo nombres, galería e imagen principal antes de guardar."
+              : `Se aplicarán ${selectedFieldsSummary} sobre ${selectedPreviewRowIndexes.length} fila(s) seleccionada(s).`
+          );
+        }
+        if (current >= 78) {
+          setApplyStatusMessage("Finalizando importación...");
+          setApplyStatusDetail("Esperando respuesta final del servidor y consolidando el resultado.");
+        }
+        return current + 7;
+      });
+    }, 400);
 
     try {
       const { tenantPath, formData } = buildFormData();
-      const response = await apiRequest<UpdateResponse>(`${tenantPath}/apply`, { method: "POST", body: formData });
-      setProgress(100);
-      setResult(response.data);
-      showToast("Actualización finalizada");
+      const response = await apiRequest<UpdateResponse>(`${tenantPath}/apply`, {
+        method: "POST",
+        body: formData,
+        retryAttempts: 1,
+      });
+      if (intervalRef.current) {
+        window.clearInterval(intervalRef.current);
+      }
+
+      if (response.data.images_job?.job_id) {
+        hasImagesJob = true;
+        setResult({
+          updated: response.data.updated,
+          failed: response.data.failed,
+          errors: response.data.errors,
+          total_rows: response.data.total_rows,
+        });
+        setProgress(5);
+        setApplyStatusMessage("Cambios generales listos. Procesando imágenes...");
+        setApplyStatusDetail("Las demás columnas ya fueron aplicadas. Ahora se actualizarán las imágenes producto por producto.");
+
+        const pollJob = async () => {
+          try {
+            const jobResponse = await apiRequest<ImportImagesJobStatus>(
+              `${tenantPath}/apply-jobs/${response.data.images_job!.job_id}`,
+              { cache: "no-store", retryAttempts: 1 }
+            );
+            const job = jobResponse.data;
+            setImagesJobStatus(job);
+            setProgress(job.progress);
+            setApplyStatusMessage(
+              job.status === "failed"
+                ? "La actualización de imágenes falló"
+                : job.status === "completed"
+                  ? "Actualización de imágenes completada"
+                  : job.stage === "indexing"
+                    ? "Indexando biblioteca de imágenes..."
+                    : job.stage === "preparing"
+                      ? "Preparando filas de imágenes..."
+                      : "Actualizando imágenes producto por producto..."
+            );
+            setApplyStatusDetail(
+              job.status === "running" || job.status === "pending"
+                ? job.stage === "indexing"
+                  ? `${job.current_product_name ?? "Construyendo índice local de imágenes."}`
+                  : job.stage === "preparing"
+                    ? `${job.prepared} de ${job.total} filas preparadas.${job.current_product_name ? ` Fila actual: ${job.current_product_name}.` : ""}`
+                    : `${job.processed} de ${job.total} productos actualizados.${job.current_product_name ? ` Producto actual: ${job.current_product_name}.` : ""}`
+                : job.status === "completed"
+                  ? `Imágenes terminadas para ${job.result?.updated ?? 0} producto(s).`
+                  : (job.error ?? "Falló el procesamiento de imágenes.")
+            );
+
+            if (job.status === "completed") {
+              const mergedResult: UpdateResponse = {
+                updated: response.data.updated + (job.result?.updated ?? 0),
+                failed: response.data.failed + (job.result?.failed ?? 0),
+                errors: [...response.data.errors, ...(job.result?.errors ?? [])],
+                total_rows: Math.max(response.data.total_rows, job.result?.total_rows ?? 0),
+              };
+              setResult(mergedResult);
+              setLoadingApply(false);
+              setTimeout(() => {
+                setShowApplyStatusModal(false);
+                setProgress(0);
+              }, 1200);
+              showToast("Actualización finalizada");
+              return true;
+            }
+
+            if (job.status === "failed") {
+              hasError = true;
+              const message = job.error ?? "Falló el procesamiento de imágenes";
+              setError(message);
+              setApplyStatusError(message);
+              setLoadingApply(false);
+              showToast(message, "error");
+              return true;
+            }
+          } catch (pollError) {
+            hasError = true;
+            const message = pollError instanceof Error ? pollError.message : "No se pudo consultar el progreso de imágenes";
+            setError(message);
+            setApplyStatusError(message);
+            setLoadingApply(false);
+            showToast(message, "error");
+            return true;
+          }
+          return false;
+        };
+
+        const finished = await pollJob();
+        if (!finished) {
+          intervalRef.current = window.setInterval(() => {
+            void pollJob().then((done) => {
+              if (done && intervalRef.current) {
+                window.clearInterval(intervalRef.current);
+                intervalRef.current = null;
+              }
+            });
+          }, 1500);
+        }
+      } else {
+        setProgress(100);
+        setResult(response.data);
+        setApplyStatusMessage("Importación finalizada");
+        setApplyStatusDetail(`Se actualizaron ${response.data.updated} producto(s). ${response.data.failed > 0 ? `Hubo ${response.data.failed} fallo(s).` : "No hubo errores."}`);
+        showToast("Actualización finalizada");
+      }
     } catch (err) {
+      hasError = true;
       const message = err instanceof Error ? err.message : "No se pudieron aplicar los cambios";
       setError(message);
+      setApplyStatusMessage("La importación falló");
+      setApplyStatusDetail("No se pudieron aplicar los cambios seleccionados.");
+      setApplyStatusError(message);
       showToast(message, "error");
     } finally {
       if (intervalRef.current) {
         window.clearInterval(intervalRef.current);
+        intervalRef.current = null;
       }
-      setTimeout(() => setProgress(0), 1000);
-      setLoadingApply(false);
+      if (!hasImagesJob) {
+        setTimeout(() => {
+          setProgress(0);
+          if (!hasError) {
+            setShowApplyStatusModal(false);
+          }
+        }, hasError ? 0 : 1000);
+        setLoadingApply(false);
+      }
     }
   };
 
@@ -303,8 +596,8 @@ export default function ImportPage() {
       setDraft(null);
       setPreview(null);
       setResult(null);
-      setIdColumn("");
-      setValueColumn("");
+      setSelectedFields([]);
+      setSelectedPreviewRowIndexes([]);
       showToast("Excel guardado eliminado");
     } catch (err) {
       showToast(err instanceof Error ? err.message : "No se pudo eliminar el Excel guardado", "error");
@@ -333,6 +626,54 @@ export default function ImportPage() {
     }
   };
 
+  const handleCopyClaudePrompt = async () => {
+    try {
+      await navigator.clipboard.writeText(claudePrompt);
+      showToast("Prompt copiado");
+    } catch {
+      showToast("No se pudo copiar el prompt", "error");
+    }
+  };
+
+  const toggleSelectedField = (field: string) => {
+    setSelectedFields((current) => (current.includes(field) ? current.filter((item) => item !== field) : [...current, field]));
+  };
+
+  const handleSelectAllFields = () => {
+    setSelectedFields(availableEditableFields);
+    setPreview(null);
+    setResult(null);
+    setIsColumnModalOpen(false);
+  };
+
+  const handleClearSelectedFields = () => {
+    setSelectedFields([]);
+    setPreview(null);
+    setResult(null);
+    setSelectedPreviewRowIndexes([]);
+  };
+
+  const allPreviewRowsSelected = Boolean(preview && preview.preview_rows.length > 0 && selectedPreviewRowIndexes.length === preview.preview_rows.length);
+
+  const togglePreviewRowIndex = (rowIndex: number) => {
+    setSelectedPreviewRowIndexes((current) => (current.includes(rowIndex) ? current.filter((item) => item !== rowIndex) : [...current, rowIndex]));
+  };
+
+  const handleToggleAllPreviewRows = () => {
+    if (!preview) {
+      return;
+    }
+    setSelectedPreviewRowIndexes(allPreviewRowsSelected ? [] : preview.preview_rows.filter((row) => row.product_found).map((row) => row.row_index));
+  };
+
+  const handleCreateProductFromRow = (row: PreviewResponse["preview_rows"][number]) => {
+    if (!activeTenant) {
+      return;
+    }
+    window.sessionStorage.setItem("woolas.import.prefill", JSON.stringify({ tenantId: activeTenant.id, row: row.row_data }));
+    window.location.href = "/products?create=import";
+  };
+
   return (
     <div className="space-y-6 lg:space-y-8">
       <section className="rounded-3xl border border-border/80 bg-card/85 p-5 shadow-sm backdrop-blur sm:p-6 lg:p-8">
@@ -351,7 +692,7 @@ export default function ImportPage() {
           <CardDescription>Descarga una plantilla base con columnas sugeridas y una hoja de instrucciones para armar el Excel correctamente.</CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-3 px-5 pb-6 sm:flex-row sm:px-6">
-          <Button className="rounded-xl" disabled={!activeTenant} onClick={() => void handleDownloadTemplate()} variant="outline">
+      <Button className="rounded-xl" disabled={!activeTenant} onClick={() => void handleDownloadTemplate()} variant="outline">
             <Download className="mr-2 h-4 w-4" />
             Descargar plantilla Excel
           </Button>
@@ -402,6 +743,58 @@ export default function ImportPage() {
             </div>
           </button>
 
+          {formatAnalysis ? (
+            <div className="rounded-2xl border border-border bg-background/70 p-4">
+              <div className="text-sm font-medium text-foreground">
+                {formatAnalysis.status === "ready" ? "Formato detectado correctamente" : formatAnalysis.status === "typos" ? "Hay encabezados por corregir" : "Este Excel necesita refactorización"}
+              </div>
+              {formatAnalysis.status === "ready" ? <div className="mt-2 text-sm text-muted-foreground">El archivo coincide con el formato esperado y puede usarse en este módulo.</div> : null}
+              {formatAnalysis.typo_suggestions.length > 0 ? (
+                <div className="mt-3 space-y-2 text-sm text-amber-700">
+                  {formatAnalysis.typo_suggestions.map((item) => (
+                    <div key={`${item.provided}-${item.expected}`}>Corrige `{item.provided}` por `{item.expected}`.</div>
+                  ))}
+                </div>
+              ) : null}
+              {formatAnalysis.missing_required.length > 0 ? (
+                <div className="mt-3 text-sm text-destructive">Faltan columnas obligatorias: {formatAnalysis.missing_required.join(", ")}.</div>
+              ) : null}
+              {formatAnalysis.unknown_headers.length > 0 ? (
+                <div className="mt-3 text-sm text-muted-foreground">Columnas no reconocidas: {formatAnalysis.unknown_headers.join(", ")}.</div>
+              ) : null}
+              {formatAnalysis.status === "refactor_required" ? (
+                <div className="mt-4 space-y-3">
+                  <div className="text-sm text-muted-foreground">
+                    Este archivo no coincide con el formato oficial. La vía recomendada es convertirlo externamente y luego volver a subirlo.
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button className="rounded-xl" onClick={() => void handleCopyClaudePrompt()} variant="outline">
+                      <Copy className="mr-2 h-4 w-4" />
+                      Copiar prompt para Claude
+                    </Button>
+                    <a href="https://claude.ai/new" rel="noreferrer" target="_blank">
+                      <Button className="rounded-xl" variant="outline">
+                        <ExternalLink className="mr-2 h-4 w-4" />
+                        Abrir Claude
+                      </Button>
+                    </a>
+                  </div>
+                  <div className="rounded-2xl border border-border bg-card p-4 text-sm text-muted-foreground">
+                    1. Descarga o ubica tu Excel actual.
+                    <br />
+                    2. Copia el prompt.
+                    <br />
+                    3. Ábrelo en Claude y adjunta tu Excel.
+                    <br />
+                    4. Pídele que te lo devuelva en el formato esperado por WooLas.
+                    <br />
+                    5. Sube aquí el archivo resultante.
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
           {uploadingDraft || uploadProgress > 0 ? (
             <div className="space-y-2 rounded-2xl border border-border bg-background/70 p-4">
               <div className="flex items-center justify-between text-sm">
@@ -436,57 +829,64 @@ export default function ImportPage() {
             </div>
           ) : null}
 
-          {previewColumns.length > 0 ? (
-            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Columna identificador</label>
-                <Select value={idColumn} onValueChange={setIdColumn}>
-                  <SelectTrigger className="h-12 rounded-xl"><SelectValue placeholder="Selecciona columna" /></SelectTrigger>
-                  <SelectContent>{previewColumns.map((column) => <SelectItem key={column} value={column}>{fieldLabels[column] ?? column}</SelectItem>)}</SelectContent>
-                </Select>
+          {previewColumns.length > 0 && formatAnalysis?.status === "ready" ? (
+            <div className="space-y-4 rounded-2xl border border-border bg-background/70 p-4">
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                <div>
+                  <div className="text-sm font-medium text-foreground">Columnas a editar</div>
+                  <div className="mt-1 text-sm text-muted-foreground">
+                    El archivo ya tiene el formato correcto. Solo selecciona qué columnas quieres aplicar sobre los productos existentes.
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button className="rounded-xl" onClick={() => setIsColumnModalOpen(true)} variant="outline">
+                    Seleccionar columnas
+                  </Button>
+                  <Button className="rounded-xl" onClick={handleSelectAllFields} variant="secondary">
+                    Editar todo
+                  </Button>
+                </div>
               </div>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Columna a editar</label>
-                <Select value={valueColumn} onValueChange={setValueColumn}>
-                  <SelectTrigger className="h-12 rounded-xl"><SelectValue placeholder="Selecciona columna" /></SelectTrigger>
-                  <SelectContent>{previewColumns.map((column) => <SelectItem key={column} value={column}>{fieldLabels[column] ?? column}</SelectItem>)}</SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Tipo de identificador</label>
-                <Select value={identifierType} onValueChange={(value) => setIdentifierType(value as "sku" | "product_id")}>
-                  <SelectTrigger className="h-12 rounded-xl"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="sku">SKU</SelectItem>
-                    <SelectItem value="product_id">ID del producto</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Campo WooCommerce</label>
-                <Select value={wcField} onValueChange={setWcField}>
-                  <SelectTrigger className="h-12 rounded-xl"><SelectValue /></SelectTrigger>
-                  <SelectContent>{wcFields.map((field) => <SelectItem key={field} value={field}>{fieldLabels[field] ?? field}</SelectItem>)}</SelectContent>
-                </Select>
-              </div>
+
+              {availableEditableFields.length === 0 ? (
+                <div className="text-sm text-muted-foreground">Este archivo no tiene columnas editables disponibles para este módulo.</div>
+              ) : selectedFields.length > 0 ? (
+                <div className="space-y-3">
+                  <div className="text-sm font-medium text-foreground">Seleccionadas: {selectedFields.length}</div>
+                  <div className="flex flex-wrap gap-2">
+                    {selectedFieldLabels.map((label, index) => (
+                      <span key={`${label}-${index}`} className="rounded-full border border-border bg-card px-3 py-1 text-xs font-medium text-foreground">
+                        {label}
+                      </span>
+                    ))}
+                  </div>
+                  <Button className="rounded-xl" onClick={handleClearSelectedFields} size="sm" variant="ghost">
+                    Limpiar selección
+                  </Button>
+                  <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3 text-xs text-amber-900">
+                    Solo se editarán estas columnas. Si aquí aparece `Imágenes` o cualquier otra que no quieras tocar, quítala antes de aplicar.
+                  </div>
+                </div>
+              ) : (
+                <div className="text-sm text-muted-foreground">No has seleccionado columnas todavía.</div>
+              )}
             </div>
           ) : null}
 
           <div className="flex flex-col gap-3 sm:flex-row">
-            <Button className="h-12 rounded-xl px-6 font-semibold" disabled={!activeTenant || !draft || !idColumn || !valueColumn || loadingPreview} onClick={handlePreview}>
+            <Button className="h-12 rounded-xl px-6 font-semibold" disabled={!activeTenant || !draft || formatAnalysis?.status !== "ready" || selectedFields.length === 0 || loadingPreview} onClick={handlePreview}>
               {loadingPreview ? "Generando vista previa..." : "Ver vista previa"}
             </Button>
-            <Button className="h-12 rounded-xl px-6 font-semibold" disabled={!activeTenant || !draft || !preview || loadingApply} onClick={handleApply} variant="secondary">
+            <Button className="h-12 rounded-xl px-6 font-semibold" disabled={!activeTenant || !draft || formatAnalysis?.status !== "ready" || selectedFields.length === 0 || selectedPreviewRowIndexes.length === 0 || !preview || loadingApply} onClick={handleApply} variant="secondary">
               {loadingApply ? "Aplicando cambios..." : "Aplicar cambios"}
             </Button>
           </div>
 
-          {loadingApply || progress > 0 ? <Progress value={progress} /> : null}
           {error ? <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-3 text-sm text-destructive">{error}</div> : null}
         </CardContent>
       </Card>
 
-      {sampleRows.length > 0 ? (
+      {sampleRows.length > 0 && formatAnalysis?.status === "ready" ? (
         <Card className="rounded-3xl border-border/80 shadow-sm">
           <CardHeader className="px-5 pt-6 sm:px-6"><CardTitle>Primeras 5 filas</CardTitle></CardHeader>
           <CardContent className="px-5 pb-6 sm:px-6">
@@ -502,34 +902,239 @@ export default function ImportPage() {
         </Card>
       ) : null}
 
-      {preview ? (
+      {preview && formatAnalysis?.status === "ready" ? (
         <Card className="rounded-3xl border-border/80 shadow-sm">
-          <CardHeader className="px-5 pt-6 sm:px-6"><CardTitle>Vista previa de cambios</CardTitle><CardDescription>{preview.total_rows} filas analizadas.</CardDescription></CardHeader>
-          <CardContent className="px-5 pb-6 sm:px-6">
-            <div className="overflow-x-auto rounded-2xl border border-border">
-              <table className="min-w-full text-sm">
-                <thead>
-                  <tr className="border-b border-border bg-accent/70">
-                    <th className="px-3 py-3 text-left font-medium">Identificador</th>
-                    <th className="px-3 py-3 text-left font-medium">Valor actual</th>
-                    <th className="px-3 py-3 text-left font-medium">Valor nuevo</th>
-                    <th className="px-3 py-3 text-left font-medium">Producto</th>
-                  </tr>
-                </thead>
-                <tbody>{preview.preview_rows.map((row) => <tr key={`${row.identifier}-${row.product_id ?? "missing"}`} className="border-b border-border/60 last:border-b-0"><td className="px-3 py-3">{row.identifier}</td><td className="px-3 py-3">{row.current_value ?? "No encontrado"}</td><td className="px-3 py-3">{row.new_value}</td><td className="px-3 py-3">{row.product_name ?? "Sin coincidencia"}</td></tr>)}</tbody>
-              </table>
-            </div>
-          </CardContent>
-        </Card>
+              <CardHeader className="px-5 pt-6 sm:px-6">
+                <CardTitle>Vista previa de cambios</CardTitle>
+                <CardDescription>{preview.total_rows} filas analizadas. {selectedPreviewRowIndexes.length} filas marcadas para aplicar. Las filas sin coincidencia solo se pueden crear.</CardDescription>
+              </CardHeader>
+              <CardContent className="px-5 pb-6 sm:px-6">
+                <div className="mb-4 flex flex-wrap items-center gap-2">
+                  <Button className="rounded-xl" onClick={handleToggleAllPreviewRows} size="sm" variant="outline">
+                    {allPreviewRowsSelected ? "Desmarcar todo" : "Marcar editables"}
+                  </Button>
+                  <div className="text-sm text-muted-foreground">
+                    Marca solo las filas que quieres editar. Las que no tienen coincidencia no se aplican y deben crearse aparte.
+                  </div>
+                </div>
+                <div className="overflow-x-auto rounded-2xl border border-border">
+                  <table className="min-w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-border bg-accent/70">
+                        <th className="px-3 py-3 text-left font-medium">#</th>
+                        <th className="px-3 py-3 text-left font-medium">Editar</th>
+                        <th className="px-3 py-3 text-left font-medium">Identificador</th>
+                        <th className="px-3 py-3 text-left font-medium">Producto</th>
+                        <th className="px-3 py-3 text-left font-medium">Columnas a actualizar</th>
+                        <th className="px-3 py-3 text-left font-medium">Acciones</th>
+                      </tr>
+                    </thead>
+                    <tbody>{preview.preview_rows.map((row) => <tr key={`${row.row_index}-${row.identifier}-${row.product_id ?? "missing"}`} className={["border-b border-border/60 last:border-b-0", !row.product_found ? "bg-muted/25 opacity-80" : ""].join(" ")}><td className="px-3 py-3 text-muted-foreground">{row.row_index + 1}</td><td className="px-3 py-3"><input checked={selectedPreviewRowIndexes.includes(row.row_index)} disabled={!row.product_found} onChange={() => togglePreviewRowIndex(row.row_index)} type="checkbox" /></td><td className="px-3 py-3">{row.identifier}</td><td className="px-3 py-3">{row.product_name ?? "Sin coincidencia"}</td><td className="px-3 py-3">{row.changed_fields.length > 0 ? row.changed_fields.map((field) => fieldLabels[field] ?? field).join(", ") : "Sin cambios"}</td><td className="px-3 py-3"><div className="flex flex-wrap gap-2">{row.product_found ? <Button className="rounded-xl" onClick={() => setSelectedPreviewRow(row)} size="sm" variant="outline">Ver comparación</Button> : null}{!row.product_found ? <Button className="rounded-xl" onClick={() => handleCreateProductFromRow(row)} size="sm">Agregar producto</Button> : null}</div></td></tr>)}</tbody>
+                  </table>
+                </div>
+              </CardContent>
+            </Card>
       ) : null}
 
-      {result ? (
+      {result && formatAnalysis?.status === "ready" ? (
         <Card className="rounded-3xl border-border/80 shadow-sm">
           <CardHeader className="px-5 pt-6 sm:px-6"><CardTitle>Resultado</CardTitle><CardDescription>{result.updated} actualizados, {result.failed} fallidos.</CardDescription></CardHeader>
           <CardContent className="px-5 pb-6 sm:px-6">
             {result.errors.length > 0 ? <div className="space-y-2 rounded-2xl border border-border bg-background/70 p-4 text-sm">{result.errors.map((item, index) => <div key={`${item.identifier}-${index}`}><span className="font-medium">{item.identifier}</span>: {item.error}</div>)}</div> : <div className="text-sm text-muted-foreground">No hubo errores en la ejecución.</div>}
           </CardContent>
         </Card>
+      ) : null}
+
+      {isColumnModalOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/55 p-4">
+          <div className="w-full max-w-3xl rounded-3xl border border-border bg-background shadow-2xl">
+            <div className="flex items-center justify-between border-b border-border px-5 py-4 sm:px-6">
+              <div>
+                <div className="text-lg font-semibold text-foreground">Seleccionar columnas</div>
+                <div className="mt-1 text-sm text-muted-foreground">Marca las columnas del Excel que quieres aplicar en esta importación.</div>
+              </div>
+              <Button className="rounded-xl" onClick={() => setIsColumnModalOpen(false)} size="icon" variant="ghost">
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+
+            <div className="max-h-[65vh] overflow-y-auto px-5 py-5 sm:px-6">
+              <div className="grid gap-3 sm:grid-cols-2">
+                {availableEditableFields.map((field) => {
+                  const checked = selectedFields.includes(field);
+                  return (
+                    <label key={field} className="flex cursor-pointer items-start gap-3 rounded-2xl border border-border bg-card/80 p-4 transition-colors hover:bg-accent/30">
+                      <input
+                        checked={checked}
+                        className="mt-1 h-4 w-4 rounded border-border"
+                        onChange={() => {
+                          toggleSelectedField(field);
+                          setPreview(null);
+                          setResult(null);
+                        }}
+                        type="checkbox"
+                      />
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium text-foreground">{fieldLabels[field] ?? field}</div>
+                        <div className="mt-1 text-xs text-muted-foreground">{field}</div>
+                      </div>
+                      {checked ? <Check className="ml-auto mt-0.5 h-4 w-4 text-primary" /> : null}
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-3 border-t border-border px-5 py-4 sm:flex-row sm:items-center sm:justify-between sm:px-6">
+              <div className="text-sm text-muted-foreground">{selectedFields.length} columnas seleccionadas</div>
+              <div className="flex flex-wrap gap-2">
+                <Button className="rounded-xl" onClick={handleSelectAllFields} variant="secondary">
+                  Editar todo
+                </Button>
+                <Button className="rounded-xl" onClick={() => setIsColumnModalOpen(false)}>
+                  Listo
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {selectedPreviewRow ? (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center bg-slate-950/55 p-4">
+          <div className="w-full max-w-4xl rounded-3xl border border-border bg-background shadow-2xl">
+            <div className="flex items-center justify-between border-b border-border px-5 py-4 sm:px-6">
+              <div>
+                <div className="text-lg font-semibold text-foreground">Comparación de cambios</div>
+                <div className="mt-1 text-sm text-muted-foreground">
+                  {selectedPreviewRow.product_found ? `${selectedPreviewRow.product_name ?? selectedPreviewRow.identifier}` : `Sin coincidencia para ${selectedPreviewRow.identifier}`}
+                </div>
+              </div>
+              <Button className="rounded-xl" onClick={() => setSelectedPreviewRow(null)} size="icon" variant="ghost">
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+            <div className="max-h-[70vh] overflow-y-auto px-5 py-5 sm:px-6">
+              <div className="overflow-hidden rounded-2xl border border-border">
+                <table className="min-w-full text-sm">
+                  <thead className="bg-accent/70">
+                    <tr>
+                      <th className="px-3 py-3 text-left font-medium">Campo</th>
+                      <th className="px-3 py-3 text-left font-medium">Antes</th>
+                      <th className="px-3 py-3 text-left font-medium">Después</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectedPreviewRow.changes.map((change) => (
+                      <tr key={change.field} className="border-b border-border/60 last:border-b-0 align-top">
+                        <td className="px-3 py-3 font-medium">{fieldLabels[change.field] ?? change.field}</td>
+                        <td className="px-3 py-3 whitespace-pre-wrap text-muted-foreground">{change.before || "Vacío"}</td>
+                        <td className="px-3 py-3 whitespace-pre-wrap">{change.after || "Vacío"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {showApplyStatusModal ? (
+        <div className="fixed inset-0 z-[95] flex items-center justify-center bg-slate-950/55 p-4">
+          <div className="w-full max-w-lg rounded-3xl border border-border bg-background shadow-2xl">
+            <div className="border-b border-border px-5 py-4 sm:px-6">
+              <div className="flex items-start gap-3">
+                <div className="rounded-2xl border border-border bg-card p-3">
+                  <LoaderCircle className={["h-5 w-5", loadingApply ? "animate-spin text-primary" : applyStatusError ? "text-destructive" : "text-emerald-600"].join(" ")} />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-lg font-semibold text-foreground">{applyStatusMessage ?? "Procesando importación..."}</div>
+                  <div className="mt-1 text-sm text-muted-foreground">
+                    {selectedPreviewRowIndexes.length} fila(s) seleccionada(s) · {selectedFieldsSummary || "Sin columnas"}
+                  </div>
+                </div>
+                {!loadingApply ? (
+                  <Button className="ml-auto rounded-xl" onClick={() => setShowApplyStatusModal(false)} size="icon" variant="ghost">
+                    <X className="h-4 w-4" />
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="space-y-4 px-5 py-5 sm:px-6">
+              <div className="rounded-2xl border border-border bg-card/70 p-4">
+                <div className="text-sm font-medium text-foreground">Qué se está haciendo</div>
+                <div className="mt-2 text-sm leading-6 text-muted-foreground">{applyStatusDetail ?? "Preparando la operación..."}</div>
+              </div>
+
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-muted-foreground">{loadingApply ? "Procesando..." : applyStatusError ? "Operación detenida" : "Operación completada"}</span>
+                  <span className="font-medium">{progress}%</span>
+                </div>
+                <Progress className="h-3" value={progress} />
+              </div>
+
+              {applyStatusError ? (
+                <div className="rounded-2xl border border-destructive/30 bg-destructive/10 px-4 py-4 text-sm text-destructive">
+                  <div className="font-medium">Error al aplicar cambios</div>
+                  <div className="mt-2 whitespace-pre-wrap">{applyStatusError}</div>
+                </div>
+              ) : null}
+
+              {imagesJobStatus?.rows?.length ? (
+                <div className="rounded-2xl border border-border bg-background/70 p-4">
+                  <div className="text-sm font-medium text-foreground">Progreso por producto</div>
+                  <div className="mt-3 max-h-64 overflow-y-auto rounded-xl border border-border">
+                    <table className="min-w-full text-sm">
+                      <thead className="bg-accent/70">
+                        <tr>
+                          <th className="px-3 py-2 text-left font-medium">Producto</th>
+                          <th className="px-3 py-2 text-left font-medium">Estado</th>
+                          <th className="px-3 py-2 text-left font-medium">Detalle</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {imagesJobStatus.rows.map((row) => (
+                          <tr key={`${row.row_index}-${row.identifier}`} className="border-b border-border/60 last:border-b-0">
+                            <td className="px-3 py-2">
+                              <div className="font-medium text-foreground">{row.product_name ?? row.identifier}</div>
+                              <div className="text-xs text-muted-foreground">{row.identifier}</div>
+                            </td>
+                            <td className="px-3 py-2">
+                              <span
+                                className={[
+                                  "inline-flex rounded-full px-2 py-1 text-xs font-medium",
+                                  row.status === "completed"
+                                    ? "bg-emerald-100 text-emerald-700"
+                                    : row.status === "failed"
+                                      ? "bg-red-100 text-red-700"
+                                      : row.status === "running"
+                                        ? "bg-amber-100 text-amber-700"
+                                        : "bg-slate-100 text-slate-700",
+                                ].join(" ")}
+                              >
+                                {row.status === "completed"
+                                  ? "Completado"
+                                  : row.status === "failed"
+                                    ? "Falló"
+                                    : row.status === "running"
+                                      ? "Procesando"
+                                      : "Pendiente"}
+                              </span>
+                            </td>
+                            <td className="px-3 py-2 text-muted-foreground">{row.error ?? (row.status === "running" ? "Actualizando imágenes..." : row.status === "completed" ? "Imágenes aplicadas." : "En cola")}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
       ) : null}
     </div>
   );

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from io import BytesIO
-from pathlib import PurePosixPath
 from pathlib import Path
 import re
 from uuid import UUID
+from difflib import SequenceMatcher
 
 from fastapi import HTTPException, status
 from openpyxl import Workbook
@@ -15,7 +16,16 @@ from sqlalchemy.orm import Session
 
 from core.config import settings
 from repositories import import_draft as import_draft_repository
+from schemas.imports import (
+    ImportApplyResult,
+    ImportExpectedField,
+    ImportFormatAnalysis,
+    ImportHeaderSuggestion,
+    ImportImagesJobRowStatus,
+    ImportImagesJobStatus,
+)
 from services import excel as excel_service
+from services import media as media_service
 
 DARK = "1E293B"
 MID = "334155"
@@ -88,6 +98,8 @@ GROUP_RANGES = [
     (39, 40, "META DATA", "4B5563"),
 ]
 
+import_apply_jobs: dict[str, ImportImagesJobStatus] = {}
+
 
 def _draft_directory(tenant_id: UUID) -> Path:
     return settings.imports_dir / str(tenant_id)
@@ -116,6 +128,11 @@ def _parse_xlsx_payload(file_bytes: bytes) -> tuple[list[str], list[dict[str, st
     return headers, rows[:5], len(rows)
 
 
+def _parse_xlsx_source_payload(file_bytes: bytes) -> tuple[list[str], list[dict[str, str]], int]:
+    headers, rows = excel_service.parse_excel(file_bytes, normalize_headers=False)
+    return headers, rows[:5], len(rows)
+
+
 def _write_file(path: Path, file_bytes: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(file_bytes)
@@ -128,6 +145,71 @@ def _remove_file(path_str: str) -> None:
             path.unlink()
     except OSError:
         pass
+
+
+def _expected_fields() -> list[ImportExpectedField]:
+    return [ImportExpectedField(key=item["key"], label=item["label"], required=bool(item["required"])) for item in COLUMN_DEFINITIONS]
+
+
+def _clean_header_label(value: str) -> str:
+    cleaned = value.strip()
+    if cleaned.startswith("* "):
+        cleaned = cleaned[2:].strip()
+    return cleaned
+
+
+def _analyze_headers(source_headers: list[str], normalized_headers: list[str]) -> ImportFormatAnalysis:
+    expected_labels = [item["label"] for item in COLUMN_DEFINITIONS]
+    required_labels = [item["label"] for item in COLUMN_DEFINITIONS if item["required"]]
+    typo_suggestions: list[ImportHeaderSuggestion] = []
+    unknown_headers: list[str] = []
+    cleaned_source_headers = [_clean_header_label(header) for header in source_headers]
+
+    for original_header, header in zip(source_headers, cleaned_source_headers, strict=False):
+        if header in expected_labels:
+            continue
+        scores = sorted(
+            ((label, SequenceMatcher(None, header.lower(), label.lower()).ratio()) for label in expected_labels),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        best_label, best_score = scores[0] if scores else ("", 0.0)
+        if best_score >= 0.72:
+            typo_suggestions.append(ImportHeaderSuggestion(provided=original_header, expected=best_label, confidence=round(best_score, 2)))
+        else:
+            unknown_headers.append(original_header)
+
+    present_labels = set(cleaned_source_headers)
+    suggested_labels = {item.expected for item in typo_suggestions}
+    missing_required = [label for label in required_labels if label not in present_labels and label not in suggested_labels]
+
+    if not typo_suggestions and not unknown_headers and not missing_required:
+        status = "ready"
+    elif typo_suggestions and not unknown_headers and not missing_required:
+        status = "typos"
+    else:
+        status = "refactor_required"
+
+    return ImportFormatAnalysis(
+        status=status,
+        source_headers=source_headers,
+        normalized_headers=normalized_headers,
+        typo_suggestions=typo_suggestions,
+        missing_required=missing_required,
+        unknown_headers=unknown_headers,
+        expected_fields=_expected_fields(),
+    )
+
+
+def _build_draft_response(record) -> dict:
+    file_bytes = Path(record.storage_path).read_bytes() if Path(record.storage_path).exists() else b""
+    source_headers, _, _ = _parse_xlsx_source_payload(file_bytes) if file_bytes else ([], [], 0)
+    analysis = _analyze_headers(source_headers, record.headers or [])
+    payload = _serialize_draft(record)
+    payload["source_headers"] = source_headers
+    payload["format_analysis"] = analysis.model_dump()
+    payload["sample_rows"] = record.sample_rows or []
+    return payload
 
 
 def _format_bool(value: object) -> str:
@@ -409,12 +491,12 @@ def save_import_draft(
         row_count=row_count,
     )
     db.commit()
-    return _serialize_draft(record)
+    return _build_draft_response(record)
 
 
 def get_current_import_draft(db: Session, tenant_id: UUID) -> dict | None:
     record = import_draft_repository.get_import_draft_for_tenant(db, tenant_id)
-    return None if record is None else _serialize_draft(record)
+    return None if record is None else _build_draft_response(record)
 
 
 def require_current_import_draft(db: Session, tenant_id: UUID):
@@ -444,7 +526,7 @@ def get_current_import_draft_bytes(db: Session, tenant_id: UUID) -> tuple[dict, 
     path = Path(record.storage_path)
     if not path.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Imported file not found")
-    return _serialize_draft(record), path.read_bytes()
+    return _build_draft_response(record), path.read_bytes()
 
 
 def build_import_template() -> tuple[str, bytes]:
@@ -468,39 +550,331 @@ def build_products_export(products: list[dict]) -> tuple[str, bytes]:
     return "productos_woocommerce.xlsx", _build_template_workbook(rows, "EXPORTACION DE PRODUCTOS - WOOCOMMERCE", highlight_first_row=False)
 
 
-async def preview_import_draft(*, db: Session, tenant_id: UUID, id_column: str, value_column: str, id_type: str, wc_field: str, products: list[dict]):
+def _canonical_row_to_template_row(row: dict[str, str]) -> list[str]:
+    return [str(row.get(item["key"]) or "") for item in COLUMN_DEFINITIONS]
+
+
+def refactor_import_draft(
+    db: Session,
+    *,
+    tenant_id: UUID,
+    user_id: UUID | None,
+    mapping: dict[str, str | None],
+) -> dict:
+    draft, file_bytes = get_current_import_draft_bytes(db, tenant_id)
+    source_headers, rows = excel_service.parse_excel(file_bytes, normalize_headers=False)
+    if not source_headers:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El Excel no tiene columnas para refactorizar")
+
+    canonical_rows: list[dict[str, str]] = []
+    for row in rows:
+        canonical_row: dict[str, str] = {}
+        for item in COLUMN_DEFINITIONS:
+            source_header = mapping.get(item["key"])
+            canonical_row[item["key"]] = row.get(source_header or "", "") if source_header else ""
+        canonical_rows.append(canonical_row)
+
+    workbook_bytes = _build_template_workbook(
+        [_canonical_row_to_template_row(row) for row in canonical_rows],
+        "EXCEL REFACTORIZADO - WOOCOMMERCE",
+        highlight_first_row=False,
+    )
+    return save_import_draft(
+        db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        filename=f"refactorizado_{draft['original_filename']}",
+        file_bytes=workbook_bytes,
+    )
+
+
+async def preview_import_draft(*, db: Session, tenant_id: UUID, selected_fields: list[str], products: list[dict]):
     _, file_bytes = get_current_import_draft_bytes(db, tenant_id)
     headers, rows = excel_service.parse_excel(file_bytes)
-    excel_service.validate_mapping(headers, id_column, value_column, wc_field)
-    preview = await excel_service.generate_preview(
-        rows=rows,
-        id_column=id_column,
-        value_column=value_column,
-        id_type=id_type,
-        wc_field=wc_field,
-        products=products,
-    )
+    excel_service.validate_selected_fields(headers, selected_fields)
+    preview = await excel_service.generate_bulk_preview(rows=rows, selected_fields=selected_fields, products=products)
     return {"headers": headers, **preview}
 
 
-async def apply_import_draft(*, db: Session, tenant_id: UUID, id_column: str, value_column: str, id_type: str, wc_field: str, products: list[dict], backup_record, woo_service):
+async def _run_import_images_job(
+    *,
+    job_id: str,
+    tenant_id: UUID,
+    backup_id: UUID,
+    rows: list[dict[str, str]],
+    selected_row_indexes: list[int] | None,
+    products: list[dict],
+    credentials: dict[str, str],
+    wp_url: str,
+    wp_user: str,
+    wp_app_password: str,
+):
+    from core.database import SessionLocal
+    from repositories import backup as backup_repository
+    from services import backup as backup_service
+    from services.woocommerce import WooCommerceService
+
+    job = import_apply_jobs[job_id]
+    woo_service = WooCommerceService(**credentials)
+    updated_products: list[dict] = []
+    result = ImportApplyResult()
+    job_db = None
+
+    try:
+        job.status = "running"
+        job.stage = "indexing"
+        job.current_identifier = "Preparando imágenes"
+        job.current_product_name = "Cargando media library y resolviendo nombres"
+        job_db = SessionLocal()
+
+        async def on_media_progress(*, processed_pages: int, total_pages: int, from_cache: bool):
+            if from_cache:
+                job.stage = "indexing"
+                job.current_identifier = "Media library lista"
+                job.current_product_name = "Usando caché local de imágenes"
+                return
+            job.stage = "indexing"
+            job.current_identifier = "Cargando media library"
+            job.current_product_name = f"Descargando páginas {processed_pages} de {total_pages}"
+            preload_progress = 5 if total_pages <= 0 else min(20, int((processed_pages / max(total_pages, 1)) * 20))
+            job.progress = preload_progress
+
+        media_items = await media_service.fetch_all_media_library_items(
+            wp_url=wp_url,
+            wp_user=wp_user,
+            wp_app_password=wp_app_password,
+            db=job_db,
+            tenant_id=tenant_id,
+            on_progress=on_media_progress,
+        )
+        job.stage = "indexing"
+        job.current_identifier = "Biblioteca de imágenes lista"
+        job.current_product_name = f"Se cargaron {len(media_items)} imágenes para esta importación"
+        job.progress = 20
+        media_lookup = media_service.build_media_lookup(media_items)
+        media_resolution_cache: dict[str, dict] = {}
+
+        async def resolve_media_names(names: list[str]) -> list[dict]:
+            resolved: list[dict] = []
+            missing_names = [name for name in names if name not in media_resolution_cache]
+            if missing_names:
+                fetched = media_service.resolve_media_names_from_items(
+                    names=missing_names,
+                    items=media_items,
+                    media_lookup=media_lookup,
+                )
+                for entry in fetched:
+                    media_resolution_cache[entry["requested"]] = entry
+            for name in names:
+                cached_entry = media_resolution_cache.get(name)
+                if cached_entry is not None:
+                    resolved.append(cached_entry)
+            return resolved
+
+        selected_indexes = set(range(len(rows))) if selected_row_indexes is None else set(selected_row_indexes)
+        products_by_id = {int(product["id"]): product for product in products if str(product.get("id", "")).isdigit()}
+        products_by_sku = {str(product.get("sku", "")): product for product in products if product.get("sku")}
+        matched_rows = []
+        for row_index, row in enumerate(rows):
+            if row_index not in selected_indexes:
+                continue
+            sku = row.get("sku", "").strip()
+            product_id = row.get("product_id", "").strip()
+            product = None
+            identifier = sku or product_id or "sin identificador"
+            if sku:
+                product = products_by_sku.get(sku)
+            elif product_id.isdigit():
+                product = products_by_id.get(int(product_id))
+            if product is not None:
+                matched_rows.append(
+                    ImportImagesJobRowStatus(
+                        row_index=row_index,
+                        identifier=identifier,
+                        product_id=int(product["id"]) if product.get("id") is not None else None,
+                        product_name=str(product.get("name") or "") or None,
+                    )
+                )
+        job.rows = matched_rows
+        total_selected = max(len(matched_rows), 1)
+
+        async def on_prepare_progress(*, stage: str, row_index: int, identifier: str, product: str | None = None, error: str | None = None):
+            row_status = next((item for item in job.rows if item.row_index == row_index), None)
+            if row_status is None:
+                return
+            ordinal = next((index for index, item in enumerate(job.rows, start=1) if item.row_index == row_index), 0)
+            if stage == "preparing":
+                job.stage = "preparing"
+                row_status.status = "running"
+                row_status.error = None
+                job.current_identifier = f"Preparando {ordinal} de {len(job.rows)}"
+                job.current_product_name = product or identifier
+                job.progress = min(60, 20 + int(ordinal * 40 / total_selected))
+            elif stage == "prepared":
+                job.stage = "preparing"
+                row_status.status = "pending"
+                job.prepared = max(job.prepared, ordinal)
+                job.current_identifier = f"Fila preparada {ordinal} de {len(job.rows)}"
+                job.current_product_name = product or identifier
+                job.progress = min(60, 20 + int(ordinal * 40 / total_selected))
+            elif stage == "failed":
+                job.stage = "preparing"
+                row_status.status = "failed"
+                row_status.error = error
+                job.current_identifier = f"Falló preparación {ordinal} de {len(job.rows)}"
+                job.current_product_name = product or identifier
+
+        payloads, preparation_errors, selected_rows = await excel_service.prepare_bulk_update_payloads(
+            rows=rows,
+            selected_fields=["images"],
+            products=products,
+            resolve_media_names=resolve_media_names,
+            selected_row_indexes=selected_row_indexes,
+            on_row_progress=on_prepare_progress,
+        )
+        result.failed += len(preparation_errors)
+        result.errors.extend(preparation_errors)
+        result.total_rows = len(selected_rows)
+        job.total = len(payloads)
+
+        for index, payload in enumerate(payloads, start=1):
+            identifier = str(payload.pop("_identifier", payload.get("id", "sin identificador")))
+            row_index = int(payload.pop("_row_index", index - 1))
+            product_name = payload.pop("_product_name", None)
+            product_id = int(payload.get("id")) if payload.get("id") is not None else None
+
+            row_status = next((item for item in job.rows if item.row_index == row_index), None)
+            if row_status is None:
+                row_status = ImportImagesJobRowStatus(
+                    row_index=row_index,
+                    identifier=identifier,
+                    product_id=product_id,
+                    product_name=product_name,
+                )
+                job.rows.append(row_status)
+
+            row_status.status = "running"
+            job.stage = "updating"
+            job.current_identifier = f"Actualizando {index} de {len(payloads)}"
+            job.current_product_name = product_name or identifier
+            job.progress = 60 + int((max(index - 1, 0) * 40) / max(len(payloads), 1))
+
+            try:
+                updated_product = await woo_service.update_product(int(payload["id"]), payload)
+                updated_products.append(updated_product)
+                result.updated += 1
+                row_status.status = "completed"
+            except Exception as exc:
+                row_status.status = "failed"
+                row_status.error = str(exc)
+                result.failed += 1
+                result.errors.append({"identifier": identifier, "error": str(exc)})
+
+            job.processed = index
+            job.progress = 60 + int(index * 40 / max(len(payloads), 1))
+
+        if updated_products:
+            backup_record = backup_repository.get_backup_for_tenant(job_db, tenant_id, backup_id)
+            if backup_record is not None:
+                backup_service.merge_products_into_backup(job_db, backup_record, updated_products)
+                job_db.commit()
+
+        job.result = result
+        job.status = "completed"
+        job.stage = "completed"
+        job.progress = 100
+        job.current_identifier = None
+        job.current_product_name = None
+    except Exception as exc:
+        job.status = "failed"
+        job.stage = "failed"
+        job.error = str(exc)
+    finally:
+        if job_db is not None:
+            job_db.close()
+
+
+async def get_import_apply_job_status(*, job_id: str):
+    job = import_apply_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Import job not found")
+    return job.model_dump()
+
+
+async def apply_import_draft(
+    *,
+    db: Session,
+    tenant_id: UUID,
+    selected_fields: list[str],
+    selected_row_indexes: list[int] | None,
+    products: list[dict],
+    backup_record,
+    woo_service,
+    credentials: dict[str, str],
+    wp_url: str | None = None,
+    wp_user: str | None = None,
+    wp_app_password: str | None = None,
+):
     _, file_bytes = get_current_import_draft_bytes(db, tenant_id)
     headers, rows = excel_service.parse_excel(file_bytes)
-    excel_service.validate_mapping(headers, id_column, value_column, wc_field)
-    summary, updated_products = await excel_service.build_update_summary(
-        rows=rows,
-        id_column=id_column,
-        value_column=value_column,
-        id_type=id_type,
-        wc_field=wc_field,
-        products=products,
-        woo_service=woo_service,
-    )
-    from services import backup as backup_service
+    excel_service.validate_selected_fields(headers, selected_fields)
+    non_image_fields = [field for field in selected_fields if field != "images"]
+    image_fields = ["images"] if "images" in selected_fields else []
 
-    backup_service.merge_products_into_backup(db, backup_record, updated_products)
-    db.commit()
-    return summary.model_dump()
+    response_summary = ImportApplyResult(total_rows=len(selected_row_indexes or rows))
+    updated_products_for_backup: list[dict] = []
+
+    if non_image_fields:
+        summary, updated_products = await excel_service.build_bulk_update_summary(
+            rows=rows,
+            selected_fields=non_image_fields,
+            products=products,
+            woo_service=woo_service,
+            selected_row_indexes=selected_row_indexes,
+        )
+        response_summary.updated += summary.updated
+        response_summary.failed += summary.failed
+        response_summary.errors.extend(summary.errors)
+        response_summary.total_rows = max(response_summary.total_rows, summary.total_rows)
+        updated_products_for_backup.extend(updated_products)
+
+    if updated_products_for_backup:
+        from services import backup as backup_service
+
+        backup_service.merge_products_into_backup(db, backup_record, updated_products_for_backup)
+        db.commit()
+
+    if not image_fields:
+        return response_summary.model_dump()
+
+    if not wp_url or not wp_user or not wp_app_password:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Este cliente no tiene credenciales de WordPress para resolver nombres de imagen")
+
+    job_id = str(uuid.uuid4())
+    import_apply_jobs[job_id] = ImportImagesJobStatus(
+        job_id=job_id,
+        status="pending",
+        current_identifier="En cola",
+        current_product_name="Esperando inicio del proceso de imágenes",
+    )
+    asyncio.create_task(
+        _run_import_images_job(
+            job_id=job_id,
+            tenant_id=backup_record.tenant_id,
+            backup_id=backup_record.id,
+            rows=rows,
+            selected_row_indexes=selected_row_indexes,
+            products=products,
+            credentials=credentials,
+            wp_url=wp_url,
+            wp_user=wp_user,
+            wp_app_password=wp_app_password,
+        )
+    )
+    return {
+        **response_summary.model_dump(),
+        "images_job": {"job_id": job_id},
+    }
 
 
 def delete_import_draft(db: Session, tenant_id: UUID) -> None:

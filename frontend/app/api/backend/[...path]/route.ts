@@ -3,6 +3,9 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { INTERNAL_API_URL } from "@/lib/api";
 
+export const dynamic = "force-dynamic";
+export const maxDuration = 300;
+
 function buildCookieHeader() {
   return cookies()
     .getAll()

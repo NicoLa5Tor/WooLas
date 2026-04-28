@@ -8,6 +8,7 @@ from core.database import Base
 import models.backup  # noqa: F401
 import models.import_draft  # noqa: F401
 import models.media_cache  # noqa: F401
+import models.media_index  # noqa: F401
 import models.tenant  # noqa: F401
 import models.user  # noqa: F401
 

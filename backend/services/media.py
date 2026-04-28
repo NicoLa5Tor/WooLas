@@ -1,12 +1,16 @@
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
+import re
+import unicodedata
 
 import httpx
 from sqlalchemy.orm import Session
 
 from repositories import media_cache as media_cache_repository
+from repositories import media_index as media_index_repository
 from schemas.media import MediaItem
 
 
@@ -26,7 +30,7 @@ def _filename_from_media(item: dict[str, Any]) -> str:
     source = item.get("source_url") or ""
     media_file = item.get("media_details", {}).get("file") or ""
     candidate = media_file or source
-    return PurePosixPath(candidate).name or f"media-{item.get('id', 'unknown')}"
+    return unquote(PurePosixPath(candidate).name) or f"media-{item.get('id', 'unknown')}"
 
 
 def _serialize_media(item: dict[str, Any]) -> dict[str, Any]:
@@ -40,12 +44,30 @@ def _serialize_media(item: dict[str, Any]) -> dict[str, Any]:
         url=item.get("source_url") or "",
         thumbnail=thumbnail,
         filename=_filename_from_media(item),
+        title=((item.get("title") or {}).get("rendered") or None),
+        slug=item.get("slug") or None,
         uploaded_at=uploaded_at,
     ).model_dump(mode="json")
 
 
+def _coerce_uploaded_at(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if text:
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    return datetime.utcnow()
+
+
 def _cache_key(page: int, search: str | None) -> str:
     return f"page:{page}|search:{(search or '').strip().lower()}"
+
+
+def _full_library_cache_key() -> str:
+    return "all-pages|search:"
 
 
 async def get_media_library(
@@ -92,6 +114,7 @@ async def get_media_library(
         total=total,
         payload=items,
     )
+    sync_media_index_records(db, tenant_id, items, remove_missing=False)
     db.commit()
 
     return {
@@ -116,5 +139,237 @@ async def upload_media(db: Session, tenant_id, wp_url: str, wp_user: str, wp_app
         payload = response.json()
 
     media_cache_repository.delete_media_cache_for_tenant(db, tenant_id)
+    item = _serialize_media(payload)
+    sync_media_index_records(db, tenant_id, [item], remove_missing=False)
     db.commit()
-    return _serialize_media(payload)
+    return item
+
+
+async def fetch_all_media_library_items(
+    *,
+    wp_url: str,
+    wp_user: str,
+    wp_app_password: str,
+    db: Session | None = None,
+    tenant_id=None,
+    cache_ttl_minutes: int = 60,
+    on_progress=None,
+) -> list[dict[str, Any]]:
+    endpoint = f"{_base_wp_url(wp_url)}/wp-json/wp/v2/media"
+    if db is not None and tenant_id is not None:
+        full_cache = media_cache_repository.get_media_cache_record(db, tenant_id, _full_library_cache_key())
+        if full_cache and full_cache.created_at + timedelta(minutes=cache_ttl_minutes) >= datetime.utcnow():
+            if on_progress is not None:
+                await on_progress(processed_pages=full_cache.total_pages, total_pages=full_cache.total_pages, from_cache=True)
+            return list(full_cache.payload or [])
+
+    items: list[dict[str, Any]] = []
+
+    async with httpx.AsyncClient(timeout=120.0, auth=httpx.BasicAuth(wp_user, wp_app_password)) as client:
+        first_response = await client.get(endpoint, params={"media_type": "image", "per_page": 100, "page": 1})
+        first_response.raise_for_status()
+        first_payload = first_response.json()
+        items.extend(_serialize_media(item) for item in first_payload)
+        total_pages = int(first_response.headers.get("X-WP-TotalPages", 1))
+        if on_progress is not None:
+            await on_progress(processed_pages=1, total_pages=total_pages, from_cache=False)
+
+        if total_pages > 1:
+            tasks = [
+                client.get(endpoint, params={"media_type": "image", "per_page": 100, "page": page})
+                for page in range(2, total_pages + 1)
+            ]
+            responses = await asyncio.gather(*tasks)
+            processed_pages = 1
+            for response in responses:
+                response.raise_for_status()
+                items.extend(_serialize_media(item) for item in response.json())
+                processed_pages += 1
+                if on_progress is not None:
+                    await on_progress(processed_pages=processed_pages, total_pages=total_pages, from_cache=False)
+
+    if db is not None and tenant_id is not None:
+        media_cache_repository.upsert_media_cache_record(
+            db,
+            tenant_id=tenant_id,
+            cache_key=_full_library_cache_key(),
+            page=1,
+            total_pages=max(1, total_pages),
+            total=len(items),
+            payload=items,
+        )
+        sync_media_index_records(db, tenant_id, items, remove_missing=True)
+        db.commit()
+
+    return items
+
+
+def sync_media_index_records(db: Session, tenant_id, items: list[dict[str, Any]], *, remove_missing: bool = True) -> list[dict[str, Any]]:
+    keep_media_ids: set[int] = set()
+    indexed_items: list[dict[str, Any]] = []
+    for item in items:
+        media_id = item.get("id")
+        if media_id is None:
+            continue
+        keep_media_ids.add(int(media_id))
+        lookup_values = list(dict.fromkeys(_item_lookup_values(item)))
+        record = media_index_repository.upsert_media_index_record(
+            db,
+            tenant_id=tenant_id,
+            media_id=int(media_id),
+            url=str(item.get("url") or ""),
+            thumbnail=str(item.get("thumbnail") or ""),
+            filename=str(item.get("filename") or ""),
+            title=None if item.get("title") in {None, ""} else str(item.get("title")),
+            slug=None if item.get("slug") in {None, ""} else str(item.get("slug")),
+            lookup_values=lookup_values,
+            uploaded_at=_coerce_uploaded_at(item.get("uploaded_at")),
+        )
+        indexed_items.append(_serialize_index_record(record))
+
+    if remove_missing:
+        media_index_repository.delete_missing_media_index_records(db, tenant_id, keep_media_ids)
+    return indexed_items
+
+
+def list_media_index_items(db: Session, tenant_id) -> list[dict[str, Any]]:
+    return [_serialize_index_record(record) for record in media_index_repository.list_media_index_records(db, tenant_id)]
+
+
+def resolve_media_by_names_from_index(*, db: Session, tenant_id, names: list[str]) -> list[dict[str, Any]]:
+    items = list_media_index_items(db, tenant_id)
+    by_filename = _build_media_lookup(items)
+    resolved: list[dict[str, Any]] = []
+    for name in names:
+        item = _find_media_in_items(name, items=items, by_lookup=by_filename)
+        resolved.append({"requested": name, "matched": item is not None, "item": item})
+    return resolved
+
+
+def resolve_media_names_from_items(*, names: list[str], items: list[dict[str, Any]], media_lookup: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    by_filename = media_lookup if media_lookup is not None else _build_media_lookup(items)
+    resolved: list[dict[str, Any]] = []
+    for name in names:
+        item = _find_media_in_items(name, items=items, by_lookup=by_filename)
+        resolved.append({"requested": name, "matched": item is not None, "item": item})
+    return resolved
+
+
+async def _search_media_items(*, wp_url: str, wp_user: str, wp_app_password: str, search: str) -> list[dict[str, Any]]:
+    endpoint = f"{_base_wp_url(wp_url)}/wp-json/wp/v2/media"
+    async with httpx.AsyncClient(timeout=60.0, auth=httpx.BasicAuth(wp_user, wp_app_password)) as client:
+        response = await client.get(endpoint, params={"media_type": "image", "per_page": 100, "search": search})
+        response.raise_for_status()
+        return response.json()
+
+
+def _build_media_lookup(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    by_filename: dict[str, dict[str, Any]] = {}
+    for item in items:
+        for lookup_value in _item_lookup_values(item):
+            by_filename.setdefault(lookup_value, item)
+    return by_filename
+
+
+def build_media_lookup(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return _build_media_lookup(items)
+
+
+def _serialize_index_record(record) -> dict[str, Any]:
+    return MediaItem(
+        id=int(record.media_id),
+        url=record.url or "",
+        thumbnail=record.thumbnail or "",
+        filename=record.filename or "",
+        title=record.title,
+        slug=record.slug,
+        uploaded_at=record.uploaded_at,
+    ).model_dump(mode="json")
+
+
+def _find_media_in_items(name: str, *, items: list[dict[str, Any]], by_lookup: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    full_name, stem = _normalize_media_lookup(name)
+    if not full_name and not stem:
+        return None
+
+    direct_match = by_lookup.get(full_name) or by_lookup.get(stem)
+    if direct_match is not None:
+        return direct_match
+
+    # Fallback local: si el usuario manda una referencia incompleta, buscamos por coincidencia
+    # dentro de filename/title/slug/url sin volver a consultar WordPress.
+    probe_values = tuple(value for value in {full_name, stem} if value)
+    for item in items:
+        values = _item_lookup_values(item)
+        if any(probe in candidate or candidate in probe for probe in probe_values for candidate in values):
+            return item
+    return None
+
+
+def _normalize_media_lookup(value: str) -> tuple[str, str]:
+    cleaned = unquote(str(value).strip().lower())
+    if not cleaned:
+        return "", ""
+    cleaned = unicodedata.normalize("NFKD", cleaned)
+    cleaned = "".join(char for char in cleaned if not unicodedata.combining(char))
+    cleaned = re.sub(r"[^\w\s.-]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    stem, dot, extension = cleaned.rpartition(".")
+    if dot and extension in {"jpg", "jpeg", "png", "webp", "gif"}:
+        return cleaned, stem
+    return cleaned, cleaned
+
+
+def _item_lookup_values(item: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for raw_value in (
+        item.get("filename"),
+        item.get("title"),
+        item.get("slug"),
+        PurePosixPath(unquote(str(item.get("url") or ""))).name,
+    ):
+        cleaned = str(raw_value or "").strip()
+        if not cleaned:
+            continue
+        full_name, stem = _normalize_media_lookup(cleaned)
+        if full_name:
+            values.append(full_name)
+        if stem:
+            values.append(stem)
+    return values
+
+
+async def resolve_media_by_names(
+    *,
+    wp_url: str,
+    wp_user: str,
+    wp_app_password: str,
+    names: list[str],
+    media_items: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    items = media_items if media_items is not None else await fetch_all_media_library_items(wp_url=wp_url, wp_user=wp_user, wp_app_password=wp_app_password)
+    by_filename = _build_media_lookup(items)
+
+    resolved: list[dict[str, Any]] = []
+    for name in names:
+        item = _find_media_in_items(name, items=items, by_lookup=by_filename)
+        if item is None and media_items is None:
+            full_name, stem = _normalize_media_lookup(name)
+            payload = await _search_media_items(wp_url=wp_url, wp_user=wp_user, wp_app_password=wp_app_password, search=name)
+            for candidate in payload:
+                candidate_item = _serialize_media(candidate)
+                candidate_values = _item_lookup_values(candidate_item)
+                if full_name in candidate_values or stem in candidate_values:
+                    item = candidate_item
+                    break
+            if item is None and payload:
+                item = _serialize_media(payload[0])
+        resolved.append(
+            {
+                "requested": name,
+                "matched": item is not None,
+                "item": item,
+            }
+        )
+
+    return resolved

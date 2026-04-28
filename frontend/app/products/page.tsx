@@ -1,7 +1,8 @@
 "use client";
 
+import { useSearchParams } from "next/navigation";
 import { Copy, Download, ExternalLink, ImagePlus, LoaderCircle, PackageSearch, Plus, Search, Trash2, X } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 
 import { MediaLibraryBrowser } from "@/components/MediaLibraryBrowser";
@@ -9,6 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/components/ui/toast";
@@ -140,6 +142,17 @@ type MediaPickerTarget =
   | { kind: "append-gallery" }
   | { kind: "variation-image"; variationIndex: number };
 
+type ResolvedMediaResult = {
+  requested: string;
+  matched: boolean;
+  item: MediaItem | null;
+};
+
+type PrefillImageResolution = {
+  images: ProductImage[];
+  unresolved: string[];
+};
+
 const tabs: Array<{ id: TabKey; label: string }> = [
   { id: "general", label: "General" },
   { id: "prices", label: "Precios" },
@@ -183,6 +196,137 @@ function toDateTimeLocal(value: string | null | undefined) {
 
 function fromDateTimeLocal(value: string) {
   return value ? new Date(value).toISOString() : null;
+}
+
+function asImportBool(value: string | undefined) {
+  return ["1", "true", "yes", "si", "sí"].includes((value ?? "").trim().toLowerCase());
+}
+
+function splitImportValues(value: string | undefined) {
+  return (value ?? "").split(/[;,\n]+/).map((item) => item.trim()).filter(Boolean);
+}
+
+function splitImportIds(value: string | undefined) {
+  return splitImportValues(value).map((item) => Number(item)).filter((item) => Number.isFinite(item));
+}
+
+function importRowToEditorProduct(row: Record<string, string>): EditorProduct {
+  const product = emptyProduct();
+  product.sku = row.sku?.trim() ?? "";
+  product.name = row.name?.trim() ?? "";
+  product.slug = row.slug?.trim() ?? "";
+  product.type = (["simple", "variable", "grouped", "external"].includes(row.type) ? row.type : "simple") as ProductType;
+  product.status = (["publish", "draft", "pending", "private"].includes(row.status) ? row.status : "publish") as ProductStatus;
+  product.featured = asImportBool(row.featured);
+  product.catalog_visibility = (["visible", "catalog", "search", "hidden"].includes(row.catalog_visibility) ? row.catalog_visibility : "visible") as CatalogVisibility;
+  product.regular_price = row.regular_price?.trim() ?? "";
+  product.sale_price = row.sale_price?.trim() ?? "";
+  product.description = row.description?.trim() ?? "";
+  product.short_description = row.short_description?.trim() ?? "";
+  product.manage_stock = asImportBool(row.manage_stock);
+  product.stock_quantity = row.stock_quantity?.trim() ?? "";
+  product.stock_status = (["instock", "outofstock", "onbackorder"].includes(row.stock_status) ? row.stock_status : "instock") as StockStatus;
+  product.backorders = (["no", "notify", "yes"].includes(row.backorders) ? row.backorders : "no") as BackordersStatus;
+  product.sold_individually = asImportBool(row.sold_individually);
+  product.low_stock_amount = row.low_stock_amount?.trim() ?? "";
+  product.weight = row.weight?.trim() ?? "";
+  product.length = row.length?.trim() ?? "";
+  product.width = row.width?.trim() ?? "";
+  product.height = row.height?.trim() ?? "";
+  product.shipping_class = row.shipping_class?.trim() ?? "";
+  product.virtual = asImportBool(row.virtual);
+  product.downloadable = asImportBool(row.downloadable);
+  product.download_limit = row.download_limit?.trim() ?? "";
+  product.download_expiry = row.download_expiry?.trim() ?? "";
+  product.categories = splitImportIds(row.category_ids);
+  product.tags = splitImportIds(row.tag_ids);
+  product.upsell_ids = splitImportIds(row.upsell_ids);
+  product.cross_sell_ids = splitImportIds(row.cross_sell_ids);
+
+  const imageIds = [...splitImportIds(row.image_principal_id), ...splitImportIds(row.image_galeria_ids)];
+  const imageNames = splitImportValues(row.image_nombres);
+  product.images = imageIds.map((id, index) => ({ id, src: "", name: imageNames[index] ?? `Media ${id}` }));
+
+  if (row.attr1_nombre?.trim() && splitImportValues(row.attr1_valores).length > 0) {
+    product.attributes.push({
+      name: row.attr1_nombre.trim(),
+      position: 0,
+      visible: true,
+      variation: true,
+      options: splitImportValues(row.attr1_valores)
+    });
+  }
+  if (row.attr2_nombre?.trim() && splitImportValues(row.attr2_valores).length > 0) {
+    product.attributes.push({
+      name: row.attr2_nombre.trim(),
+      position: 1,
+      visible: true,
+      variation: true,
+      options: splitImportValues(row.attr2_valores)
+    });
+  }
+  if (row.meta_key?.trim()) {
+    product.meta_data = [{ key: row.meta_key.trim(), value: row.meta_value?.trim() ?? "" }];
+  }
+  return product;
+}
+
+async function resolvePrefillImages(tenantId: string, row: Record<string, string>): Promise<PrefillImageResolution> {
+  const names = splitImportValues(row.image_nombres);
+  const principalIds = splitImportIds(row.image_principal_id);
+  const galleryIds = splitImportIds(row.image_galeria_ids);
+  const orderedIds = [...principalIds, ...galleryIds];
+
+  if (names.length === 0) {
+    return {
+      images: orderedIds.map((id, index) => ({
+      id,
+      src: "",
+      name: index === 0 ? "Imagen principal" : `Galeria ${index}`,
+      })),
+      unresolved: []
+    };
+  }
+
+  const response = await apiRequest<ResolvedMediaResult[]>(withTenantPath(tenantId, "/media/resolve"), {
+    method: "POST",
+    body: JSON.stringify({ names }),
+  });
+
+  const resolvedImages = response.data
+    .filter((entry) => entry.matched && entry.item)
+    .map((entry) => ({
+      id: entry.item!.id,
+      src: entry.item!.url,
+      name: entry.item!.filename,
+      alt: entry.item!.filename,
+    }));
+
+  const unresolved = response.data.filter((entry) => !entry.matched).map((entry) => entry.requested);
+  if (resolvedImages.length > 0) {
+    return { images: resolvedImages, unresolved };
+  }
+
+  return {
+    images: orderedIds.map((id, index) => ({
+      id,
+      src: "",
+      name: names[index] ?? (index === 0 ? "Imagen principal" : `Galeria ${index}`),
+    })),
+    unresolved
+  };
+}
+
+async function resolveSelectedProductImages(tenantId: string, product: EditorProduct): Promise<PrefillImageResolution> {
+  const names = product.images.map((image) => image.name).filter((name): name is string => Boolean(name?.trim()));
+  if (names.length === 0) {
+    return { images: product.images, unresolved: [] };
+  }
+  return resolvePrefillImages(tenantId, {
+    image_nombres: names.join(", "),
+    image_principal_id: product.images[0]?.id ? String(product.images[0].id) : "",
+    image_galeria_ids: product.images.slice(1).map((image) => image.id).join(";")
+  });
 }
 
 function emptyProduct(): EditorProduct {
@@ -438,6 +582,7 @@ async function downloadFile(path: string, fallbackFilename: string) {
 
 export default function ProductsPage() {
   const { showToast } = useToast();
+  const searchParams = useSearchParams();
   const [session, setSession] = useState<AuthSession | null>(null);
   const [products, setProducts] = useState<Product[]>([]);
   const [categories, setCategories] = useState<TaxonomyItem[]>([]);
@@ -463,6 +608,13 @@ export default function ProductsPage() {
   const [pagination, setPagination] = useState({ total: 0, total_pages: 1 });
   const [relatedSearch, setRelatedSearch] = useState("");
   const [relatedLoading, setRelatedLoading] = useState(false);
+  const [importPrefillConsumed, setImportPrefillConsumed] = useState(false);
+  const [importPrefillStatus, setImportPrefillStatus] = useState<string | null>(null);
+  const [saveOperationStatus, setSaveOperationStatus] = useState<string | null>(null);
+  const [saveOperationError, setSaveOperationError] = useState<string | null>(null);
+  const [saveOperationProgress, setSaveOperationProgress] = useState(0);
+  const [saveOperationMode, setSaveOperationMode] = useState<"create" | "edit" | "images" | null>(null);
+  const saveOperationIntervalRef = useRef<number | null>(null);
 
   const activeTenant = session ? resolveActiveTenant(session) : null;
 
@@ -548,6 +700,53 @@ export default function ProductsPage() {
   }, [activeTenant?.id]);
 
   useEffect(() => {
+    if (!activeTenant || importPrefillConsumed || searchParams.get("create") !== "import") {
+      return;
+    }
+
+    const consumePrefill = async () => {
+      const raw = window.sessionStorage.getItem("woolas.import.prefill");
+      if (!raw) {
+        setImportPrefillConsumed(true);
+        return;
+      }
+      try {
+        const payload = JSON.parse(raw) as { tenantId?: string; row?: Record<string, string> };
+        if (payload.tenantId !== activeTenant.id || !payload.row) {
+          setImportPrefillConsumed(true);
+          return;
+        }
+        setImportPrefillStatus("Preparando producto desde el Excel importado...");
+        const nextProduct = importRowToEditorProduct(payload.row);
+        setImportPrefillStatus("Resolviendo imágenes del producto en la media library...");
+        const imageResolution = await resolvePrefillImages(activeTenant.id, payload.row);
+        nextProduct.images = imageResolution.images;
+        if (imageResolution.unresolved.length > 0) {
+          setImportPrefillStatus(`No se encontraron estas imágenes: ${imageResolution.unresolved.join(", ")}`);
+        } else if (imageResolution.images.length === 0) {
+          setImportPrefillStatus("No se encontraron imágenes para este producto en la media library.");
+        } else {
+          setImportPrefillStatus(`Se resolvieron ${imageResolution.images.length} imágenes. Abriendo el editor...`);
+        }
+        setEditorMode("create");
+        setActiveTab("general");
+        setPanelLoading(false);
+        setVariations([]);
+        setSelectedProduct(nextProduct);
+        window.sessionStorage.removeItem("woolas.import.prefill");
+      } catch {
+        setImportPrefillStatus("No se pudo preparar el producto desde el Excel importado.");
+        window.sessionStorage.removeItem("woolas.import.prefill");
+      } finally {
+        setImportPrefillConsumed(true);
+        window.setTimeout(() => setImportPrefillStatus(null), 2500);
+      }
+    };
+
+    void consumePrefill();
+  }, [activeTenant, importPrefillConsumed, searchParams]);
+
+  useEffect(() => {
     if (!selectedProduct) {
       return;
     }
@@ -600,10 +799,39 @@ export default function ProductsPage() {
     }
 
     setSaving(true);
+    setSaveOperationError(null);
+    setSaveOperationProgress(10);
+    setSaveOperationMode(selectedProduct.images.length > 0 ? "images" : editorMode);
+    setSaveOperationStatus(
+      selectedProduct.images.length > 0
+        ? `Editando imágenes de ${selectedProduct.name.trim()}...`
+        : `${editorMode === "create" ? "Creando" : "Guardando"} producto ${selectedProduct.name.trim()}...`
+    );
+    if (saveOperationIntervalRef.current) {
+      window.clearInterval(saveOperationIntervalRef.current);
+    }
+    saveOperationIntervalRef.current = window.setInterval(() => {
+      setSaveOperationProgress((current) => (current >= 90 ? current : current + 6));
+    }, 350);
     try {
+      let productToSave = selectedProduct;
+      if (selectedProduct.images.length > 0) {
+        setSaveOperationStatus(`Validando imágenes de ${selectedProduct.name.trim()} en la media library...`);
+        const imageResolution = await resolveSelectedProductImages(activeTenant.id, selectedProduct);
+        if (imageResolution.images.length > 0) {
+          productToSave = { ...selectedProduct, images: imageResolution.images };
+          setSelectedProduct(productToSave);
+        }
+        if (imageResolution.unresolved.length > 0) {
+          setSaveOperationError(`No se encontraron estas imágenes: ${imageResolution.unresolved.join(", ")}`);
+          setSaveOperationStatus(`Imágenes no resueltas para ${selectedProduct.name.trim()}`);
+        } else {
+          setSaveOperationStatus(`Imágenes validadas para ${selectedProduct.name.trim()}`);
+        }
+      }
       const response = editorMode === "create"
-        ? await apiRequest<Product>(withTenantPath(activeTenant.id, "/products"), { method: "POST", body: JSON.stringify(buildPayload(selectedProduct)) })
-        : await apiRequest<Product>(withTenantPath(activeTenant.id, `/products/${selectedProduct.id}`), { method: "PUT", body: JSON.stringify(buildPayload(selectedProduct)) });
+        ? await apiRequest<Product>(withTenantPath(activeTenant.id, "/products"), { method: "POST", body: JSON.stringify(buildPayload(productToSave)) })
+        : await apiRequest<Product>(withTenantPath(activeTenant.id, `/products/${selectedProduct.id}`), { method: "PUT", body: JSON.stringify(buildPayload(productToSave)) });
 
       const product = toEditorProduct(response.data);
       setSelectedProduct(product);
@@ -611,12 +839,25 @@ export default function ProductsPage() {
       if (product.type === "variable" && response.data.id) {
         await loadVariations(response.data.id);
       }
+      setSaveOperationProgress(100);
+      setSaveOperationStatus(editorMode === "create" ? `Producto ${selectedProduct.name.trim()} creado` : `Producto ${selectedProduct.name.trim()} actualizado`);
       showToast(editorMode === "create" ? "Producto creado" : "Producto actualizado");
       await loadProducts(session ?? undefined);
     } catch (err) {
       showToast(err instanceof Error ? err.message : "No se pudo guardar", "error");
+      setSaveOperationError(err instanceof Error ? err.message : "No se pudo guardar");
+      setSaveOperationStatus(`Error al guardar ${selectedProduct.name.trim()}`);
+      setSaveOperationProgress(100);
     } finally {
       setSaving(false);
+      if (saveOperationIntervalRef.current) {
+        window.clearInterval(saveOperationIntervalRef.current);
+      }
+      window.setTimeout(() => {
+        setSaveOperationStatus(null);
+        setSaveOperationError(null);
+        setSaveOperationProgress(0);
+      }, 1600);
     }
   };
 
@@ -1233,6 +1474,44 @@ export default function ProductsPage() {
             ) : null}
           </div>
         </>
+      ) : null}
+
+      {importPrefillStatus ? (
+        <div className="fixed inset-0 z-[85] flex items-center justify-center bg-slate-950/55 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-lg rounded-3xl border border-border bg-card p-6 shadow-2xl">
+            <div className="flex items-start gap-4">
+              <LoaderCircle className="mt-1 h-6 w-6 animate-spin text-primary" />
+              <div>
+                <div className="text-lg font-semibold text-foreground">Preparando producto</div>
+                <div className="mt-2 text-sm leading-6 text-muted-foreground">{importPrefillStatus}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {saveOperationStatus ? (
+        <div className="fixed inset-0 z-[86] flex items-center justify-center bg-slate-950/35 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-3xl border border-border bg-card p-5 shadow-2xl">
+            <div className="flex items-start gap-4">
+              <LoaderCircle className="mt-0.5 h-6 w-6 animate-spin text-primary" />
+              <div className="min-w-0 flex-1">
+                <div className="text-base font-semibold text-foreground">
+                  {saveOperationMode === "images" ? "Proceso de imágenes" : "Proceso de producto"}
+                </div>
+                <div className="mt-1 text-sm leading-6 text-muted-foreground">{saveOperationStatus}</div>
+                {saveOperationError ? <div className="mt-3 rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-3 text-sm text-destructive">{saveOperationError}</div> : null}
+                <div className="mt-4 space-y-2">
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span>Progreso</span>
+                    <span>{saveOperationProgress}%</span>
+                  </div>
+                  <Progress className="h-3" value={saveOperationProgress} />
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       ) : null}
 
       {mediaPickerTarget && selectedProduct && activeTenant ? (

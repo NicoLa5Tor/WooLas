@@ -7,11 +7,12 @@ import re
 import unicodedata
 
 import httpx
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from repositories import media_cache as media_cache_repository
 from repositories import media_index as media_index_repository
-from schemas.media import MediaItem
+from schemas.media import MediaItem, MediaSyncJobStatus
 
 
 def _base_wp_url(wc_url: str) -> str:
@@ -164,31 +165,36 @@ async def fetch_all_media_library_items(
             return list(full_cache.payload or [])
 
     items: list[dict[str, Any]] = []
+    all_media_ids: set[int] = set()
+    total_pages = 1
 
     async with httpx.AsyncClient(timeout=120.0, auth=httpx.BasicAuth(wp_user, wp_app_password)) as client:
-        first_response = await client.get(endpoint, params={"media_type": "image", "per_page": 100, "page": 1})
-        first_response.raise_for_status()
-        first_payload = first_response.json()
-        items.extend(_serialize_media(item) for item in first_payload)
-        total_pages = int(first_response.headers.get("X-WP-TotalPages", 1))
-        if on_progress is not None:
-            await on_progress(processed_pages=1, total_pages=total_pages, from_cache=False)
+        for page in range(1, 10_000):
+            response = await client.get(endpoint, params={"media_type": "image", "per_page": 100, "page": page})
+            response.raise_for_status()
+            page_items = [_serialize_media(item) for item in response.json()]
+            if not page_items:
+                break
+            total_pages = int(response.headers.get("X-WP-TotalPages", page))
+            items.extend(page_items)
+            for item in page_items:
+                if item.get("id"):
+                    all_media_ids.add(int(item["id"]))
 
-        if total_pages > 1:
-            tasks = [
-                client.get(endpoint, params={"media_type": "image", "per_page": 100, "page": page})
-                for page in range(2, total_pages + 1)
-            ]
-            responses = await asyncio.gather(*tasks)
-            processed_pages = 1
-            for response in responses:
-                response.raise_for_status()
-                items.extend(_serialize_media(item) for item in response.json())
-                processed_pages += 1
-                if on_progress is not None:
-                    await on_progress(processed_pages=processed_pages, total_pages=total_pages, from_cache=False)
+            # Commit each page incrementally — if sync fails mid-way, pages already saved
+            if db is not None and tenant_id is not None:
+                sync_media_index_records(db, tenant_id, page_items, remove_missing=False)
+                db.commit()
+
+            if on_progress is not None:
+                await on_progress(processed_pages=page, total_pages=total_pages, from_cache=False)
+
+            if page >= total_pages:
+                break
 
     if db is not None and tenant_id is not None:
+        # Remove stale entries only after all pages collected
+        media_index_repository.delete_missing_media_index_records(db, tenant_id, all_media_ids)
         media_cache_repository.upsert_media_cache_record(
             db,
             tenant_id=tenant_id,
@@ -198,10 +204,76 @@ async def fetch_all_media_library_items(
             total=len(items),
             payload=items,
         )
-        sync_media_index_records(db, tenant_id, items, remove_missing=True)
         db.commit()
 
     return items
+
+
+media_sync_jobs: dict[str, MediaSyncJobStatus] = {}
+
+
+async def _run_media_sync_job(
+    *,
+    job_id: str,
+    tenant_id,
+    wp_url: str,
+    wp_user: str,
+    wp_app_password: str,
+) -> None:
+    from core.database import SessionLocal
+
+    job = media_sync_jobs[job_id]
+    db = None
+    try:
+        job.status = "running"
+        db = SessionLocal()
+
+        async def on_progress(*, processed_pages: int, total_pages: int, from_cache: bool) -> None:
+            job.processed_pages = processed_pages
+            job.total_pages = max(total_pages, 1)
+            job.from_cache = from_cache
+            job.progress = min(95, int(processed_pages * 95 / max(total_pages, 1)))
+
+        # cache_ttl_minutes=0 → ignora caché, siempre descarga fresco de WP
+        items = await fetch_all_media_library_items(
+            wp_url=wp_url,
+            wp_user=wp_user,
+            wp_app_password=wp_app_password,
+            db=db,
+            tenant_id=tenant_id,
+            cache_ttl_minutes=0,
+            on_progress=on_progress,
+        )
+        job.total_items = len(items)
+        job.progress = 100
+        job.status = "completed"
+    except Exception as exc:
+        job.status = "failed"
+        job.error = str(exc)
+    finally:
+        if db is not None:
+            db.close()
+
+
+def start_media_sync(*, tenant_id, wp_url: str, wp_user: str, wp_app_password: str) -> MediaSyncJobStatus:
+    import uuid
+    job_id = str(uuid.uuid4())
+    job = MediaSyncJobStatus(job_id=job_id, status="pending")
+    media_sync_jobs[job_id] = job
+    asyncio.create_task(
+        _run_media_sync_job(
+            job_id=job_id,
+            tenant_id=tenant_id,
+            wp_url=wp_url,
+            wp_user=wp_user,
+            wp_app_password=wp_app_password,
+        )
+    )
+    return job
+
+
+def get_media_sync_job(job_id: str) -> MediaSyncJobStatus | None:
+    return media_sync_jobs.get(job_id)
 
 
 def sync_media_index_records(db: Session, tenant_id, items: list[dict[str, Any]], *, remove_missing: bool = True) -> list[dict[str, Any]]:
@@ -232,6 +304,53 @@ def sync_media_index_records(db: Session, tenant_id, items: list[dict[str, Any]]
     return indexed_items
 
 
+def get_media_library_from_index(
+    db: Session,
+    tenant_id,
+    *,
+    page: int = 1,
+    per_page: int = 50,
+    search: str | None = None,
+) -> dict[str, Any]:
+    items, total = media_index_repository.list_media_index_records_paginated(
+        db, tenant_id, page=page, per_page=per_page, search=search
+    )
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    return {
+        "items": [_serialize_index_record(r) for r in items],
+        "page": page,
+        "total_pages": total_pages,
+        "total": total,
+        "from_index": True,
+    }
+
+
+def get_media_index_count(db: Session, tenant_id) -> int:
+    return media_index_repository.count_media_index_records(db, tenant_id)
+
+
+MEDIA_INDEX_MAX_AGE_HOURS = 2
+
+
+def get_media_index_last_synced(db: Session, tenant_id) -> datetime | None:
+    record = media_cache_repository.get_media_cache_record(db, tenant_id, _full_library_cache_key())
+    return record.created_at if record else None
+
+
+def require_fresh_media_index(db: Session, tenant_id) -> None:
+    last_synced = get_media_index_last_synced(db, tenant_id)
+    if last_synced is None:
+        raise HTTPException(
+            status_code=409,
+            detail="El índice de imágenes no ha sido sincronizado. Ve a Imágenes y pulsa 'Sincronizar índice' antes de continuar.",
+        )
+    if last_synced + timedelta(hours=MEDIA_INDEX_MAX_AGE_HOURS) < datetime.utcnow():
+        raise HTTPException(
+            status_code=409,
+            detail=f"El índice de imágenes tiene más de {MEDIA_INDEX_MAX_AGE_HOURS} horas. Ve a Imágenes y vuelve a sincronizar.",
+        )
+
+
 def list_media_index_items(db: Session, tenant_id) -> list[dict[str, Any]]:
     return [_serialize_index_record(record) for record in media_index_repository.list_media_index_records(db, tenant_id)]
 
@@ -251,6 +370,31 @@ def resolve_media_names_from_items(*, names: list[str], items: list[dict[str, An
     resolved: list[dict[str, Any]] = []
     for name in names:
         item = _find_media_in_items(name, items=items, by_lookup=by_filename)
+        resolved.append({"requested": name, "matched": item is not None, "item": item})
+    return resolved
+
+
+async def resolve_media_by_names_targeted(
+    *,
+    wp_url: str,
+    wp_user: str,
+    wp_app_password: str,
+    names: list[str],
+) -> list[dict[str, Any]]:
+    """Per-name WP search only — no full library fetch. Used as fallback after index miss."""
+    resolved: list[dict[str, Any]] = []
+    for name in names:
+        full_name, stem = _normalize_media_lookup(name)
+        if not full_name and not stem:
+            resolved.append({"requested": name, "matched": False, "item": None})
+            continue
+        payload = await _search_media_items(
+            wp_url=wp_url, wp_user=wp_user, wp_app_password=wp_app_password, search=name
+        )
+        serialized = [_serialize_media(c) for c in payload]
+        lookup = _build_media_lookup(serialized)
+        # _find_media_in_items handles exact match + substring fallback in both directions
+        item = _find_media_in_items(name, items=serialized, by_lookup=lookup)
         resolved.append({"requested": name, "matched": item is not None, "item": item})
     return resolved
 
@@ -313,7 +457,10 @@ def _normalize_media_lookup(value: str) -> tuple[str, str]:
     cleaned = unicodedata.normalize("NFKD", cleaned)
     cleaned = "".join(char for char in cleaned if not unicodedata.combining(char))
     cleaned = re.sub(r"[^\w\s.-]+", " ", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Normalize spaces → dashes so "nombre con espacios.jpg" matches "nombre-con-espacios.jpg" (WP slug style)
+    cleaned = cleaned.replace(" ", "-")
+    cleaned = re.sub(r"-{2,}", "-", cleaned)
     stem, dot, extension = cleaned.rpartition(".")
     if dot and extension in {"jpg", "jpeg", "png", "webp", "gif"}:
         return cleaned, stem
@@ -362,8 +509,6 @@ async def resolve_media_by_names(
                 if full_name in candidate_values or stem in candidate_values:
                     item = candidate_item
                     break
-            if item is None and payload:
-                item = _serialize_media(payload[0])
         resolved.append(
             {
                 "requested": name,

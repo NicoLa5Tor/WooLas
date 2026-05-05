@@ -1,13 +1,16 @@
 "use client";
 
-import { Check, Copy, Download, ExternalLink, FileSpreadsheet, LoaderCircle, Trash2, UploadCloud, X } from "lucide-react";
+import { AlertCircle, Check, CheckCircle2, Circle, Copy, Download, ExternalLink, FileSpreadsheet, LoaderCircle, RefreshCw, Trash2, UploadCloud, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { useToast } from "@/components/ui/toast";
+import { useProcesses } from "@/contexts/ProcessesContext";
 import { apiRequest, FRONTEND_API_PREFIX, resolveActiveTenant, type AuthSession, uploadFileWithProgress, withTenantPath } from "@/lib/api";
+
+type SkuCandidate = { id: number | null; name: string | null; sku: string | null };
 
 type PreviewResponse = {
   headers: string[];
@@ -20,6 +23,8 @@ type PreviewResponse = {
     changed_fields: string[];
     changes: Array<{ field: string; before: string; after: string }>;
     row_data: Record<string, string>;
+    ambiguous: boolean;
+    sku_candidates: SkuCandidate[];
   }>;
   sample_rows: Array<Record<string, string>>;
   total_rows: number;
@@ -33,10 +38,18 @@ type UpdateResponse = {
   images_job?: { job_id: string } | null;
 };
 
+type ApplyResultRow = {
+  row_index: number;
+  identifier: string;
+  product_name: string | null;
+  status: "ok" | "failed" | "skipped";
+  error: string | null;
+};
+
 type ImportImagesJobStatus = {
   job_id: string;
   status: "pending" | "running" | "completed" | "failed";
-  stage: "pending" | "indexing" | "preparing" | "updating" | "completed" | "failed";
+  stage: "pending" | "preparing" | "updating" | "completed" | "failed";
   progress: number;
   prepared: number;
   processed: number;
@@ -48,11 +61,12 @@ type ImportImagesJobStatus = {
     identifier: string;
     product_id: number | null;
     product_name: string | null;
-    status: "pending" | "running" | "completed" | "failed";
+    status: "pending" | "running" | "completed" | "failed" | "skipped";
     error: string | null;
   }>;
   result: {
     updated: number;
+    skipped: number;
     failed: number;
     errors: Array<{ identifier: string; error: string }>;
     total_rows: number;
@@ -189,6 +203,7 @@ async function downloadFile(path: string, fallbackFilename: string) {
 
 export default function ImportPage() {
   const { showToast } = useToast();
+  const { addProcess, finishProcess } = useProcesses();
   const [session, setSession] = useState<AuthSession | null>(null);
   const [draft, setDraft] = useState<ImportDraft | null>(null);
   const [selectedFields, setSelectedFields] = useState<string[]>([]);
@@ -202,15 +217,18 @@ export default function ImportPage() {
   const [error, setError] = useState<string | null>(null);
   const intervalRef = useRef<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const activeRowRef = useRef<HTMLDivElement | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isColumnModalOpen, setIsColumnModalOpen] = useState(false);
   const [selectedPreviewRowIndexes, setSelectedPreviewRowIndexes] = useState<number[]>([]);
+  const [productIdOverrides, setProductIdOverrides] = useState<Record<number, number>>({});
   const [selectedPreviewRow, setSelectedPreviewRow] = useState<PreviewResponse["preview_rows"][number] | null>(null);
   const [applyStatusMessage, setApplyStatusMessage] = useState<string | null>(null);
   const [applyStatusDetail, setApplyStatusDetail] = useState<string | null>(null);
   const [applyStatusError, setApplyStatusError] = useState<string | null>(null);
   const [showApplyStatusModal, setShowApplyStatusModal] = useState(false);
   const [imagesJobStatus, setImagesJobStatus] = useState<ImportImagesJobStatus | null>(null);
+  const [applyRows, setApplyRows] = useState<ApplyResultRow[]>([]);
 
   const previewColumns = useMemo(() => draft?.headers.filter(Boolean) ?? [], [draft]);
   const sampleRows = draft?.sample_rows ?? [];
@@ -316,7 +334,7 @@ export default function ImportPage() {
       const response = await apiRequest<ImportDraft | null>(withTenantPath(tenantId, "/imports/current"), { cache: "no-store" });
       const currentDraft = response.data;
       setDraft(currentDraft);
-      setPreview(null);
+      setPreview(null); setProductIdOverrides({});
       setResult(null);
       setSelectedFields([]);
       setSelectedPreviewRowIndexes([]);
@@ -350,9 +368,16 @@ export default function ImportPage() {
     }
   }, [activeTenant?.id]);
 
+  // Auto-scroll to the active row when it changes
+  useEffect(() => {
+    if (activeRowRef.current) {
+      activeRowRef.current.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [imagesJobStatus?.rows?.find?.((r) => r.status === "running")?.row_index]);
+
   const handleDraftUpload = async (selectedFile: File | null) => {
     setError(null);
-    setPreview(null);
+    setPreview(null); setProductIdOverrides({});
     setResult(null);
     if (!selectedFile || !activeTenant) {
       return;
@@ -393,6 +418,9 @@ export default function ImportPage() {
     const formData = new FormData();
     formData.append("selected_fields", JSON.stringify(selectedFields));
     formData.append("selected_row_indexes", JSON.stringify(selectedPreviewRowIndexes));
+    if (Object.keys(productIdOverrides).length > 0) {
+      formData.append("product_id_overrides", JSON.stringify(productIdOverrides));
+    }
     return { tenantPath: withTenantPath(activeTenant.id, "/imports"), formData };
   };
 
@@ -400,11 +428,12 @@ export default function ImportPage() {
     setLoadingPreview(true);
     setError(null);
     setResult(null);
+    setProductIdOverrides({});
     try {
       const { tenantPath, formData } = buildFormData();
       const response = await apiRequest<PreviewResponse>(`${tenantPath}/preview`, { method: "POST", body: formData });
       setPreview(response.data);
-      setSelectedPreviewRowIndexes(response.data.preview_rows.filter((row) => row.product_found).map((row) => row.row_index));
+      setSelectedPreviewRowIndexes(response.data.preview_rows.filter((row) => row.product_found && !row.ambiguous).map((row) => row.row_index));
     } catch (err) {
       const message = err instanceof Error ? err.message : "No se pudo generar la vista previa";
       setError(message);
@@ -414,12 +443,65 @@ export default function ImportPage() {
     }
   };
 
+  const buildApplyRows = (
+    res: UpdateResponse,
+    currentPreview: PreviewResponse,
+    appliedIndexes: number[],
+    imageRows?: ImportImagesJobStatus["rows"],
+  ): ApplyResultRow[] => {
+    const errorMap = new Map<string, string>();
+    for (const e of res.errors) errorMap.set(e.identifier, e.error);
+
+    // image job rows override status for image fields
+    const imgRowMap = new Map<number, ImportImagesJobStatus["rows"][number]>();
+    for (const r of imageRows ?? []) imgRowMap.set(r.row_index, r);
+
+    return appliedIndexes.map((ri) => {
+      const previewRow = currentPreview.preview_rows.find((r) => r.row_index === ri);
+      const identifier = previewRow?.identifier ?? String(ri);
+      const product_name = previewRow?.product_name ?? null;
+      const imgRow = imgRowMap.get(ri);
+
+      if (imgRow) {
+        return {
+          row_index: ri,
+          identifier,
+          product_name,
+          status: imgRow.status === "completed" ? "ok" : imgRow.status === "skipped" ? "skipped" : "failed",
+          error: imgRow.error,
+        };
+      }
+
+      const error = errorMap.get(identifier) ?? null;
+      return {
+        row_index: ri,
+        identifier,
+        product_name,
+        status: error ? "failed" : "ok",
+        error,
+      };
+    });
+  };
+
+  const handleRetryRows = (rowIndexes: number[]) => {
+    setSelectedPreviewRowIndexes(rowIndexes);
+    setResult(null);
+    setApplyRows([]);
+    setError(null);
+    // scroll to apply button area
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
   const handleApply = async () => {
     let hasError = false;
     let hasImagesJob = false;
+    // Snapshot at start — don't let user interaction change these mid-flight
+    const appliedIndexes = [...selectedPreviewRowIndexes];
+    const appliedPreview = preview;
     setLoadingApply(true);
     setError(null);
     setResult(null);
+    setApplyRows([]);
     setApplyStatusError(null);
     setImagesJobStatus(null);
     setShowApplyStatusModal(true);
@@ -464,6 +546,12 @@ export default function ImportPage() {
 
       if (response.data.images_job?.job_id) {
         hasImagesJob = true;
+        const imgJobId = response.data.images_job.job_id;
+        addProcess({
+          type: "image_import",
+          label: "Importar imágenes masivo",
+          pollUrl: `/tenants/${activeTenant.id}/apply-jobs/${imgJobId}`,
+        });
         setResult({
           updated: response.data.updated,
           failed: response.data.failed,
@@ -488,19 +576,15 @@ export default function ImportPage() {
                 ? "La actualización de imágenes falló"
                 : job.status === "completed"
                   ? "Actualización de imágenes completada"
-                  : job.stage === "indexing"
-                    ? "Indexando biblioteca de imágenes..."
-                    : job.stage === "preparing"
-                      ? "Preparando filas de imágenes..."
-                      : "Actualizando imágenes producto por producto..."
+                  : job.stage === "preparing"
+                    ? "Preparando imágenes por producto..."
+                    : "Actualizando imágenes producto por producto..."
             );
             setApplyStatusDetail(
               job.status === "running" || job.status === "pending"
-                ? job.stage === "indexing"
-                  ? `${job.current_product_name ?? "Construyendo índice local de imágenes."}`
-                  : job.stage === "preparing"
-                    ? `${job.prepared} de ${job.total} filas preparadas.${job.current_product_name ? ` Fila actual: ${job.current_product_name}.` : ""}`
-                    : `${job.processed} de ${job.total} productos actualizados.${job.current_product_name ? ` Producto actual: ${job.current_product_name}.` : ""}`
+                ? job.stage === "preparing"
+                  ? `Resolviendo imágenes: ${job.prepared} de ${job.total} filas listas.${job.current_product_name ? ` Actual: ${job.current_product_name}.` : ""}`
+                  : `${job.processed} de ${job.total} productos actualizados.${job.current_product_name ? ` Actual: ${job.current_product_name}.` : ""}`
                 : job.status === "completed"
                   ? `Imágenes terminadas para ${job.result?.updated ?? 0} producto(s).`
                   : (job.error ?? "Falló el procesamiento de imágenes.")
@@ -514,12 +598,19 @@ export default function ImportPage() {
                 total_rows: Math.max(response.data.total_rows, job.result?.total_rows ?? 0),
               };
               setResult(mergedResult);
+              if (appliedPreview) {
+                setApplyRows(buildApplyRows(mergedResult, appliedPreview, appliedIndexes, job.rows));
+              }
               setLoadingApply(false);
+              const hasFailed = mergedResult.failed > 0;
               setTimeout(() => {
                 setShowApplyStatusModal(false);
                 setProgress(0);
               }, 1200);
-              showToast("Actualización finalizada");
+              showToast(
+                hasFailed ? `${mergedResult.updated} actualizados, ${mergedResult.failed} fallidos` : "Actualización finalizada",
+                hasFailed ? "error" : undefined
+              );
               return true;
             }
 
@@ -558,16 +649,29 @@ export default function ImportPage() {
       } else {
         setProgress(100);
         setResult(response.data);
-        setApplyStatusMessage("Importación finalizada");
-        setApplyStatusDetail(`Se actualizaron ${response.data.updated} producto(s). ${response.data.failed > 0 ? `Hubo ${response.data.failed} fallo(s).` : "No hubo errores."}`);
-        showToast("Actualización finalizada");
+        if (appliedPreview) {
+          setApplyRows(buildApplyRows(response.data, appliedPreview, appliedIndexes));
+        }
+        const hasFailed = response.data.failed > 0;
+        const hasUpdated = response.data.updated > 0;
+        setApplyStatusMessage(
+          hasFailed && !hasUpdated ? "Ningún producto fue actualizado" :
+          hasFailed ? "Importación finalizada con errores" : "Importación finalizada"
+        );
+        setApplyStatusDetail(`Se actualizaron ${response.data.updated} producto(s).${hasFailed ? ` ${response.data.failed} fallo(s) — ver detalles abajo.` : " No hubo errores."}`);
+        showToast(
+          hasFailed
+            ? `${response.data.updated} actualizados, ${response.data.failed} fallidos`
+            : "Actualización finalizada",
+          hasFailed ? "error" : undefined
+        );
       }
     } catch (err) {
       hasError = true;
       const message = err instanceof Error ? err.message : "No se pudieron aplicar los cambios";
       setError(message);
       setApplyStatusMessage("La importación falló");
-      setApplyStatusDetail("No se pudieron aplicar los cambios seleccionados.");
+      setApplyStatusDetail(message);
       setApplyStatusError(message);
       showToast(message, "error");
     } finally {
@@ -594,7 +698,7 @@ export default function ImportPage() {
     try {
       await apiRequest(withTenantPath(activeTenant.id, `/imports/${draft.id}`), { method: "DELETE" });
       setDraft(null);
-      setPreview(null);
+      setPreview(null); setProductIdOverrides({});
       setResult(null);
       setSelectedFields([]);
       setSelectedPreviewRowIndexes([]);
@@ -641,14 +745,14 @@ export default function ImportPage() {
 
   const handleSelectAllFields = () => {
     setSelectedFields(availableEditableFields);
-    setPreview(null);
+    setPreview(null); setProductIdOverrides({});
     setResult(null);
     setIsColumnModalOpen(false);
   };
 
   const handleClearSelectedFields = () => {
     setSelectedFields([]);
-    setPreview(null);
+    setPreview(null); setProductIdOverrides({});
     setResult(null);
     setSelectedPreviewRowIndexes([]);
   };
@@ -877,7 +981,18 @@ export default function ImportPage() {
             <Button className="h-12 rounded-xl px-6 font-semibold" disabled={!activeTenant || !draft || formatAnalysis?.status !== "ready" || selectedFields.length === 0 || loadingPreview} onClick={handlePreview}>
               {loadingPreview ? "Generando vista previa..." : "Ver vista previa"}
             </Button>
-            <Button className="h-12 rounded-xl px-6 font-semibold" disabled={!activeTenant || !draft || formatAnalysis?.status !== "ready" || selectedFields.length === 0 || selectedPreviewRowIndexes.length === 0 || !preview || loadingApply} onClick={handleApply} variant="secondary">
+            <Button
+              className="h-12 rounded-xl px-6 font-semibold"
+              disabled={
+                !activeTenant || !draft || formatAnalysis?.status !== "ready" ||
+                selectedFields.length === 0 || selectedPreviewRowIndexes.length === 0 || !preview || loadingApply ||
+                // Block if any selected row still has unresolved ambiguous SKU
+                selectedPreviewRowIndexes.some((i) => preview?.preview_rows.find((r) => r.row_index === i)?.ambiguous && !productIdOverrides[i])
+              }
+              onClick={handleApply}
+              variant="secondary"
+              title={selectedPreviewRowIndexes.some((i) => preview?.preview_rows.find((r) => r.row_index === i)?.ambiguous && !productIdOverrides[i]) ? "Hay filas con SKU ambiguo sin resolver" : undefined}
+            >
               {loadingApply ? "Aplicando cambios..." : "Aplicar cambios"}
             </Button>
           </div>
@@ -929,21 +1044,154 @@ export default function ImportPage() {
                         <th className="px-3 py-3 text-left font-medium">Acciones</th>
                       </tr>
                     </thead>
-                    <tbody>{preview.preview_rows.map((row) => <tr key={`${row.row_index}-${row.identifier}-${row.product_id ?? "missing"}`} className={["border-b border-border/60 last:border-b-0", !row.product_found ? "bg-muted/25 opacity-80" : ""].join(" ")}><td className="px-3 py-3 text-muted-foreground">{row.row_index + 1}</td><td className="px-3 py-3"><input checked={selectedPreviewRowIndexes.includes(row.row_index)} disabled={!row.product_found} onChange={() => togglePreviewRowIndex(row.row_index)} type="checkbox" /></td><td className="px-3 py-3">{row.identifier}</td><td className="px-3 py-3">{row.product_name ?? "Sin coincidencia"}</td><td className="px-3 py-3">{row.changed_fields.length > 0 ? row.changed_fields.map((field) => fieldLabels[field] ?? field).join(", ") : "Sin cambios"}</td><td className="px-3 py-3"><div className="flex flex-wrap gap-2">{row.product_found ? <Button className="rounded-xl" onClick={() => setSelectedPreviewRow(row)} size="sm" variant="outline">Ver comparación</Button> : null}{!row.product_found ? <Button className="rounded-xl" onClick={() => handleCreateProductFromRow(row)} size="sm">Agregar producto</Button> : null}</div></td></tr>)}</tbody>
+                    <tbody>{preview.preview_rows.map((row) => {
+                      const chosenId = productIdOverrides[row.row_index];
+                      const isAmbiguousUnresolved = row.ambiguous && !chosenId;
+                      const resolvedName = chosenId
+                        ? (row.sku_candidates.find((c) => c.id === chosenId)?.name ?? `ID ${chosenId}`)
+                        : row.product_name;
+                      const isFound = row.product_found || Boolean(chosenId);
+                      return (
+                        <tr key={`${row.row_index}-${row.identifier}-${row.product_id ?? "missing"}`} className={["border-b border-border/60 last:border-b-0", isAmbiguousUnresolved ? "bg-amber-50/40 dark:bg-amber-950/20" : !isFound ? "bg-muted/25 opacity-80" : ""].join(" ")}>
+                          <td className="px-3 py-3 text-muted-foreground">{row.row_index + 1}</td>
+                          <td className="px-3 py-3">
+                            <input
+                              checked={selectedPreviewRowIndexes.includes(row.row_index)}
+                              disabled={!isFound || isAmbiguousUnresolved}
+                              onChange={() => togglePreviewRowIndex(row.row_index)}
+                              type="checkbox"
+                            />
+                          </td>
+                          <td className="px-3 py-3">{row.identifier}</td>
+                          <td className="px-3 py-3">
+                            {isAmbiguousUnresolved ? (
+                              <div className="space-y-1.5">
+                                <div className="text-xs font-medium text-amber-600 dark:text-amber-400">SKU ambiguo — elige producto:</div>
+                                <select
+                                  className="w-full rounded-lg border border-amber-400/60 bg-background px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-amber-400"
+                                  defaultValue=""
+                                  onChange={(e) => {
+                                    const pid = Number(e.target.value);
+                                    if (!pid) return;
+                                    setProductIdOverrides((prev) => ({ ...prev, [row.row_index]: pid }));
+                                    setSelectedPreviewRowIndexes((prev) => prev.includes(row.row_index) ? prev : [...prev, row.row_index]);
+                                  }}
+                                >
+                                  <option disabled value="">Seleccionar...</option>
+                                  {row.sku_candidates.map((c) => (
+                                    <option key={c.id} value={c.id ?? ""}>{c.name ?? `ID ${c.id}`}</option>
+                                  ))}
+                                </select>
+                              </div>
+                            ) : resolvedName ?? "Sin coincidencia"}
+                          </td>
+                          <td className="px-3 py-3">{row.changed_fields.length > 0 ? row.changed_fields.map((field) => fieldLabels[field] ?? field).join(", ") : "Sin cambios"}</td>
+                          <td className="px-3 py-3">
+                            <div className="flex flex-wrap gap-2">
+                              {isFound && !isAmbiguousUnresolved ? <Button className="rounded-xl" onClick={() => setSelectedPreviewRow(row)} size="sm" variant="outline">Ver comparación</Button> : null}
+                              {!isFound ? <Button className="rounded-xl" onClick={() => handleCreateProductFromRow(row)} size="sm">Agregar producto</Button> : null}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}</tbody>
                   </table>
                 </div>
               </CardContent>
             </Card>
       ) : null}
 
-      {result && formatAnalysis?.status === "ready" ? (
-        <Card className="rounded-3xl border-border/80 shadow-sm">
-          <CardHeader className="px-5 pt-6 sm:px-6"><CardTitle>Resultado</CardTitle><CardDescription>{result.updated} actualizados, {result.failed} fallidos.</CardDescription></CardHeader>
-          <CardContent className="px-5 pb-6 sm:px-6">
-            {result.errors.length > 0 ? <div className="space-y-2 rounded-2xl border border-border bg-background/70 p-4 text-sm">{result.errors.map((item, index) => <div key={`${item.identifier}-${index}`}><span className="font-medium">{item.identifier}</span>: {item.error}</div>)}</div> : <div className="text-sm text-muted-foreground">No hubo errores en la ejecución.</div>}
-          </CardContent>
-        </Card>
-      ) : null}
+      {result && applyRows.length > 0 && formatAnalysis?.status === "ready" ? (() => {
+        const failedRows = applyRows.filter((r) => r.status === "failed");
+        const okRows = applyRows.filter((r) => r.status === "ok");
+        const skippedRows = applyRows.filter((r) => r.status === "skipped");
+        return (
+          <Card className="rounded-3xl border-border/80 shadow-sm">
+            <CardHeader className="px-5 pt-6 sm:px-6">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <CardTitle>Resultado de la importación</CardTitle>
+                  <CardDescription className="mt-1">
+                    <span className="text-emerald-600 dark:text-emerald-400">{okRows.length} actualizados</span>
+                    {skippedRows.length > 0 ? <span className="ml-2 text-amber-600 dark:text-amber-400">{skippedRows.length} omitidos</span> : null}
+                    {failedRows.length > 0 ? <span className="ml-2 text-destructive">{failedRows.length} fallidos</span> : null}
+                  </CardDescription>
+                </div>
+                {failedRows.length > 0 ? (
+                  <Button
+                    className="shrink-0 rounded-xl"
+                    onClick={() => handleRetryRows(failedRows.map((r) => r.row_index))}
+                    size="sm"
+                    variant="outline"
+                  >
+                    <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                    Reintentar todos los fallidos ({failedRows.length})
+                  </Button>
+                ) : null}
+              </div>
+            </CardHeader>
+            <CardContent className="px-5 pb-6 sm:px-6">
+              <div className="overflow-x-auto rounded-2xl border border-border">
+                <table className="min-w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-border bg-accent/70">
+                      <th className="px-3 py-3 text-left font-medium">#</th>
+                      <th className="px-3 py-3 text-left font-medium">Estado</th>
+                      <th className="px-3 py-3 text-left font-medium">Identificador</th>
+                      <th className="px-3 py-3 text-left font-medium">Producto</th>
+                      <th className="px-3 py-3 text-left font-medium">Detalle</th>
+                      <th className="px-3 py-3 text-left font-medium"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {applyRows.map((row) => (
+                      <tr
+                        key={row.row_index}
+                        className={[
+                          "border-b border-border/60 last:border-b-0",
+                          row.status === "failed" ? "bg-destructive/5" : row.status === "skipped" ? "bg-amber-50/40 dark:bg-amber-950/20" : "",
+                        ].join(" ")}
+                      >
+                        <td className="px-3 py-3 text-muted-foreground">{row.row_index + 1}</td>
+                        <td className="px-3 py-3">
+                          {row.status === "ok" ? (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400">
+                              <CheckCircle2 className="h-3 w-3" /> OK
+                            </span>
+                          ) : row.status === "skipped" ? (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                              <Circle className="h-3 w-3" /> Omitido
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-red-100 px-2 py-0.5 text-[11px] font-medium text-red-700 dark:bg-red-900/30 dark:text-red-400">
+                              <AlertCircle className="h-3 w-3" /> Error
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-3 py-3 font-mono text-xs">{row.identifier}</td>
+                        <td className="px-3 py-3 text-muted-foreground">{row.product_name ?? "—"}</td>
+                        <td className="px-3 py-3 text-xs text-muted-foreground">{row.error ?? (row.status === "ok" ? "Actualizado correctamente" : "Sin datos")}</td>
+                        <td className="px-3 py-3">
+                          {row.status === "failed" ? (
+                            <Button
+                              className="rounded-xl"
+                              onClick={() => handleRetryRows([row.row_index])}
+                              size="sm"
+                              variant="outline"
+                            >
+                              <RefreshCw className="mr-1 h-3 w-3" /> Reintentar
+                            </Button>
+                          ) : null}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </CardContent>
+          </Card>
+        );
+      })() : null}
 
       {isColumnModalOpen ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/55 p-4">
@@ -969,7 +1217,7 @@ export default function ImportPage() {
                         className="mt-1 h-4 w-4 rounded border-border"
                         onChange={() => {
                           toggleSelectedField(field);
-                          setPreview(null);
+                          setPreview(null); setProductIdOverrides({});
                           setResult(null);
                         }}
                         type="checkbox"
@@ -1041,98 +1289,130 @@ export default function ImportPage() {
       ) : null}
 
       {showApplyStatusModal ? (
-        <div className="fixed inset-0 z-[95] flex items-center justify-center bg-slate-950/55 p-4">
-          <div className="w-full max-w-lg rounded-3xl border border-border bg-background shadow-2xl">
-            <div className="border-b border-border px-5 py-4 sm:px-6">
-              <div className="flex items-start gap-3">
-                <div className="rounded-2xl border border-border bg-card p-3">
-                  <LoaderCircle className={["h-5 w-5", loadingApply ? "animate-spin text-primary" : applyStatusError ? "text-destructive" : "text-emerald-600"].join(" ")} />
-                </div>
-                <div className="min-w-0">
-                  <div className="text-lg font-semibold text-foreground">{applyStatusMessage ?? "Procesando importación..."}</div>
-                  <div className="mt-1 text-sm text-muted-foreground">
-                    {selectedPreviewRowIndexes.length} fila(s) seleccionada(s) · {selectedFieldsSummary || "Sin columnas"}
-                  </div>
-                </div>
-                {!loadingApply ? (
-                  <Button className="ml-auto rounded-xl" onClick={() => setShowApplyStatusModal(false)} size="icon" variant="ghost">
-                    <X className="h-4 w-4" />
-                  </Button>
-                ) : null}
+        <div className="fixed inset-0 z-[95] flex items-end justify-center bg-slate-950/55 sm:items-center sm:p-4">
+          <div className="flex w-full max-w-2xl flex-col rounded-t-3xl border border-border bg-background shadow-2xl sm:rounded-3xl" style={{ maxHeight: "90dvh" }}>
+
+            {/* Header */}
+            <div className="flex shrink-0 items-start gap-3 border-b border-border px-5 py-4 sm:px-6">
+              <div className="rounded-2xl border border-border bg-card p-2.5">
+                <LoaderCircle className={["h-5 w-5", loadingApply ? "animate-spin text-primary" : applyStatusError ? "text-destructive" : "text-emerald-600"].join(" ")} />
               </div>
+              <div className="min-w-0 flex-1">
+                <div className="text-base font-semibold text-foreground sm:text-lg">{applyStatusMessage ?? "Procesando importación..."}</div>
+                <div className="mt-0.5 text-xs text-muted-foreground sm:text-sm">
+                  {selectedPreviewRowIndexes.length} fila(s) · {selectedFieldsSummary || "Sin columnas"}
+                </div>
+              </div>
+              <Button className="shrink-0 rounded-xl" onClick={() => setShowApplyStatusModal(false)} size="icon" title="Minimizar — el proceso sigue en segundo plano" variant="ghost">
+                <X className="h-4 w-4" />
+              </Button>
             </div>
 
-            <div className="space-y-4 px-5 py-5 sm:px-6">
-              <div className="rounded-2xl border border-border bg-card/70 p-4">
-                <div className="text-sm font-medium text-foreground">Qué se está haciendo</div>
-                <div className="mt-2 text-sm leading-6 text-muted-foreground">{applyStatusDetail ?? "Preparando la operación..."}</div>
-              </div>
-
-              <div className="space-y-2">
-                <div className="flex items-center justify-between text-sm">
-                  <span className="text-muted-foreground">{loadingApply ? "Procesando..." : applyStatusError ? "Operación detenida" : "Operación completada"}</span>
-                  <span className="font-medium">{progress}%</span>
+            {/* Progress bar + detail */}
+            <div className="shrink-0 space-y-3 px-5 pt-4 sm:px-6">
+              {imagesJobStatus?.current_product_name && imagesJobStatus.status === "running" ? (
+                <div className="rounded-xl border border-border bg-muted/40 px-3 py-2 text-sm">
+                  <span className="text-muted-foreground">Actualizando: </span>
+                  <span className="font-semibold text-foreground">{imagesJobStatus.current_product_name}</span>
+                  <span className="ml-2 text-xs text-muted-foreground">({imagesJobStatus.processed + 1} / {imagesJobStatus.total})</span>
                 </div>
-                <Progress className="h-3" value={progress} />
+              ) : null}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs text-muted-foreground">
+                  <span>{applyStatusDetail ?? "Preparando..."}</span>
+                  <span className="font-medium tabular-nums">{progress}%</span>
+                </div>
+                <Progress className="h-2" value={progress} />
               </div>
 
               {applyStatusError ? (
-                <div className="rounded-2xl border border-destructive/30 bg-destructive/10 px-4 py-4 text-sm text-destructive">
-                  <div className="font-medium">Error al aplicar cambios</div>
-                  <div className="mt-2 whitespace-pre-wrap">{applyStatusError}</div>
-                </div>
-              ) : null}
-
-              {imagesJobStatus?.rows?.length ? (
-                <div className="rounded-2xl border border-border bg-background/70 p-4">
-                  <div className="text-sm font-medium text-foreground">Progreso por producto</div>
-                  <div className="mt-3 max-h-64 overflow-y-auto rounded-xl border border-border">
-                    <table className="min-w-full text-sm">
-                      <thead className="bg-accent/70">
-                        <tr>
-                          <th className="px-3 py-2 text-left font-medium">Producto</th>
-                          <th className="px-3 py-2 text-left font-medium">Estado</th>
-                          <th className="px-3 py-2 text-left font-medium">Detalle</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {imagesJobStatus.rows.map((row) => (
-                          <tr key={`${row.row_index}-${row.identifier}`} className="border-b border-border/60 last:border-b-0">
-                            <td className="px-3 py-2">
-                              <div className="font-medium text-foreground">{row.product_name ?? row.identifier}</div>
-                              <div className="text-xs text-muted-foreground">{row.identifier}</div>
-                            </td>
-                            <td className="px-3 py-2">
-                              <span
-                                className={[
-                                  "inline-flex rounded-full px-2 py-1 text-xs font-medium",
-                                  row.status === "completed"
-                                    ? "bg-emerald-100 text-emerald-700"
-                                    : row.status === "failed"
-                                      ? "bg-red-100 text-red-700"
-                                      : row.status === "running"
-                                        ? "bg-amber-100 text-amber-700"
-                                        : "bg-slate-100 text-slate-700",
-                                ].join(" ")}
-                              >
-                                {row.status === "completed"
-                                  ? "Completado"
-                                  : row.status === "failed"
-                                    ? "Falló"
-                                    : row.status === "running"
-                                      ? "Procesando"
-                                      : "Pendiente"}
-                              </span>
-                            </td>
-                            <td className="px-3 py-2 text-muted-foreground">{row.error ?? (row.status === "running" ? "Actualizando imágenes..." : row.status === "completed" ? "Imágenes aplicadas." : "En cola")}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+                <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-2.5 text-sm text-destructive">
+                  <span className="font-medium">Error: </span>{applyStatusError}
                 </div>
               ) : null}
             </div>
+
+            {/* Per-product list */}
+            {imagesJobStatus?.rows?.length ? (
+              <div className="min-h-0 flex-1 overflow-hidden px-5 pb-5 pt-3 sm:px-6">
+                <div className="mb-2 flex items-center justify-between">
+                  <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Productos</span>
+                  <span className="text-xs text-muted-foreground">
+                    {imagesJobStatus.rows.filter((r) => r.status === "completed" || r.status === "skipped").length} / {imagesJobStatus.rows.length} procesados
+                  </span>
+                </div>
+                <div className="h-full overflow-y-auto rounded-2xl border border-border">
+                  {imagesJobStatus.rows.map((row) => (
+                    <div
+                      key={`${row.row_index}-${row.identifier}`}
+                      ref={row.status === "running" ? activeRowRef : null}
+                      className="border-b border-border/50 px-4 py-3 last:border-b-0"
+                    >
+                      {/* Header: icon + name + badge */}
+                      <div className="flex items-center gap-2">
+                        <div className="shrink-0">
+                          {row.status === "completed" ? (
+                            <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                          ) : row.status === "failed" ? (
+                            <AlertCircle className="h-4 w-4 text-destructive" />
+                          ) : row.status === "skipped" ? (
+                            <AlertCircle className="h-4 w-4 text-amber-500" />
+                          ) : row.status === "running" ? (
+                            <LoaderCircle className="h-4 w-4 animate-spin text-primary" />
+                          ) : (
+                            <Circle className="h-4 w-4 text-muted-foreground/30" />
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm font-medium leading-tight text-foreground">
+                            {row.product_name ?? row.identifier}
+                          </div>
+                          {row.product_name && row.identifier !== row.product_name ? (
+                            <div className="truncate text-[11px] text-muted-foreground">{row.identifier}</div>
+                          ) : null}
+                        </div>
+                        <span className={[
+                          "shrink-0 rounded-full px-2 py-0.5 text-[11px] font-medium",
+                          row.status === "completed" ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400"
+                            : row.status === "failed" ? "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400"
+                              : row.status === "skipped" ? "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
+                                : row.status === "running" ? "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400"
+                                  : "bg-muted text-muted-foreground",
+                        ].join(" ")}>
+                          {row.status === "completed" ? "Listo" : row.status === "failed" ? "Falló" : row.status === "skipped" ? "Omitido" : row.status === "running" ? "Enviando" : "En cola"}
+                        </span>
+                      </div>
+
+                      {/* Progress bar */}
+                      <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                        {row.status === "completed" ? (
+                          <div className="h-full w-full rounded-full bg-emerald-500" />
+                        ) : row.status === "failed" ? (
+                          <div className="h-full w-full rounded-full bg-destructive" />
+                        ) : row.status === "skipped" ? (
+                          <div className="h-full w-full rounded-full bg-amber-400" />
+                        ) : row.status === "running" ? (
+                          <div className="h-full w-1/3 animate-[progress_1s_ease-in-out_infinite] rounded-full bg-primary" style={{ animation: "slideProgress 1.2s ease-in-out infinite" }} />
+                        ) : (
+                          <div className="h-full w-0" />
+                        )}
+                      </div>
+
+                      {/* Error / skip reason */}
+                      {(row.status === "failed" || row.status === "skipped") && row.error ? (
+                        <div className={`mt-1 text-[11px] ${row.status === "skipped" ? "text-amber-600 dark:text-amber-400" : "text-destructive"}`}>{row.error}</div>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="px-5 pb-5 pt-3 sm:px-6">
+                <div className="rounded-2xl border border-border bg-card/70 p-4 text-sm text-muted-foreground">
+                  {applyStatusDetail ?? "Preparando la operación..."}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       ) : null}

@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from core.dependencies import TenantAccessContext, get_db, require_admin, require_role
 from core.responses import success_response
-from models.user import Role
+from models.user import Role, User
 from schemas.user import AdminClientCreate, AdminClientUpdate, UserCreate, UserUpdate
 from services import user as user_service
 
@@ -47,3 +47,9 @@ async def create_admin_client(payload: AdminClientCreate, _: object = Depends(re
 @admin_router.patch("/{user_id}")
 async def update_admin_client(user_id: UUID, payload: AdminClientUpdate, _: object = Depends(require_admin), db: Session = Depends(get_db)):
     return success_response(user_service.update_admin_client(db, user_id, payload))
+
+
+@admin_router.delete("/{user_id}")
+async def delete_admin_client(user_id: UUID, actor: User = Depends(require_admin), db: Session = Depends(get_db)):
+    user_service.delete_admin_client(db, user_id, actor)
+    return success_response({"deleted": str(user_id)})

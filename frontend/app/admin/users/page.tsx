@@ -8,6 +8,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { apiRequest, setStoredTenantId, type AdminClient, type AuthSession } from "@/lib/api";
 import { useToast } from "@/components/ui/toast";
+import { Trash2, AlertTriangle } from "lucide-react";
 
 export default function AdminUsersPage() {
   const router = useRouter();
@@ -18,6 +19,8 @@ export default function AdminUsersPage() {
   const [creating, setCreating] = useState(false);
   const [resetPasswords, setResetPasswords] = useState<Record<string, string>>({});
   const [wpCredentials, setWpCredentials] = useState<Record<string, { wp_user: string; wp_app_password: string }>>({});
+  const [confirmDelete, setConfirmDelete] = useState<AdminClient | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const [form, setForm] = useState({
     name: "",
     email: "",
@@ -130,6 +133,20 @@ export default function AdminUsersPage() {
     });
   };
 
+  const deleteClient = async (client: AdminClient) => {
+    setDeleting(true);
+    try {
+      await apiRequest(`/api/admin/clients/${client.id}`, { method: "DELETE" });
+      setConfirmDelete(null);
+      showToast(`Cliente "${client.tenant_name}" eliminado`);
+      await loadData();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "No se pudo eliminar el cliente", "error");
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   const openTenant = (tenantId: string) => {
     setStoredTenantId(tenantId);
     router.push("/backup");
@@ -216,6 +233,9 @@ export default function AdminUsersPage() {
                       <Button onClick={() => void updateClient(client.id, { is_active: !client.is_active })} size="sm" variant={client.is_active ? "outline" : "secondary"}>
                         {client.is_active ? "Desactivar" : "Reactivar"}
                       </Button>
+                      <Button onClick={() => setConfirmDelete(client)} size="sm" variant="destructive">
+                        <Trash2 className="mr-1 h-3.5 w-3.5" /> Eliminar
+                      </Button>
                     </div>
                     <div className="mt-4 flex flex-col gap-2 sm:flex-row">
                       <Input
@@ -239,7 +259,7 @@ export default function AdminUsersPage() {
                 {clients.length === 0 ? <div className="rounded-2xl border border-border bg-background/70 px-4 py-6 text-sm text-muted-foreground">No hay clientes registrados.</div> : null}
               </div>
 
-              <div className="hidden overflow-hidden rounded-2xl border border-border md:block">
+              <div className="hidden overflow-x-auto rounded-2xl border border-border md:block">
                 <table className="min-w-full text-sm">
                   <thead className="bg-accent/70">
                     <tr>
@@ -252,6 +272,7 @@ export default function AdminUsersPage() {
                       <th className="px-4 py-3 text-left font-medium">Estado</th>
                       <th className="px-4 py-3 text-left font-medium">Reset contraseña</th>
                       <th className="px-4 py-3 text-left font-medium">Abrir</th>
+                      <th className="px-4 py-3 text-left font-medium">Eliminar</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border bg-card">
@@ -306,11 +327,16 @@ export default function AdminUsersPage() {
                             Entrar
                           </Button>
                         </td>
+                        <td className="px-4 py-3 align-top">
+                          <Button onClick={() => setConfirmDelete(client)} size="sm" variant="destructive">
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        </td>
                       </tr>
                     ))}
                     {clients.length === 0 ? (
                       <tr>
-                        <td className="px-4 py-6 text-muted-foreground" colSpan={9}>
+                        <td className="px-4 py-6 text-muted-foreground" colSpan={10}>
                           No hay clientes registrados.
                         </td>
                       </tr>
@@ -322,6 +348,36 @@ export default function AdminUsersPage() {
           )}
         </CardContent>
       </Card>
+      {confirmDelete ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4">
+          <div className="w-full max-w-md rounded-3xl border border-border bg-background shadow-2xl">
+            <div className="flex items-start gap-4 border-b border-border px-6 py-5">
+              <div className="rounded-2xl border border-destructive/40 bg-destructive/10 p-2.5">
+                <AlertTriangle className="h-5 w-5 text-destructive" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="text-base font-semibold text-foreground">Eliminar cliente</div>
+                <div className="mt-1 text-sm text-muted-foreground">
+                  Esta acción es permanente y no se puede deshacer.
+                </div>
+              </div>
+            </div>
+            <div className="px-6 py-5">
+              <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-foreground">
+                Se eliminará <span className="font-semibold">{confirmDelete.tenant_name}</span> junto con todos sus backups, importaciones e índice de imágenes.
+              </div>
+              <div className="mt-4 flex justify-end gap-3">
+                <Button className="rounded-xl" disabled={deleting} onClick={() => setConfirmDelete(null)} variant="outline">
+                  Cancelar
+                </Button>
+                <Button className="rounded-xl" disabled={deleting} onClick={() => void deleteClient(confirmDelete)} variant="destructive">
+                  {deleting ? "Eliminando..." : "Sí, eliminar"}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

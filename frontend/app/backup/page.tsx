@@ -1,7 +1,9 @@
 "use client";
 
-import { AlertTriangle, ChevronDown, LoaderCircle, RefreshCcw, RotateCcw, Upload } from "lucide-react";
+import { AlertTriangle, ChevronDown, LoaderCircle, RefreshCcw, RotateCcw, Trash2, Upload, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+
+import { useProcesses } from "@/contexts/ProcessesContext";
 
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -33,12 +35,19 @@ type BackupGroups = {
 
 type BackupResponse = BackupGroups | BackupItem[];
 
-type RestoreResponse = {
-  safety_backup: BackupItem;
+type RestoreJobStatus = {
+  job_id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  progress: number;
+  current_batch: number;
+  total_batches: number;
+  current_product_name: string | null;
   updated: number;
   failed: number;
-  errors: Array<{ identifier: string; error: string }>;
   total_products: number;
+  errors: Array<{ identifier: string; error: string }>;
+  safety_backup_id: string | null;
+  error: string | null;
 };
 
 const EMPTY_BACKUP_GROUPS: BackupGroups = { active_backups: [], restore_backups: [] };
@@ -108,6 +117,7 @@ function normalizeBackupGroups(data: BackupResponse | undefined): BackupGroups {
 
 export default function BackupPage() {
   const { showToast } = useToast();
+  const { addProcess, finishProcess } = useProcesses();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [session, setSession] = useState<AuthSession | null>(null);
   const [backupGroups, setBackupGroups] = useState<BackupGroups>(EMPTY_BACKUP_GROUPS);
@@ -121,15 +131,17 @@ export default function BackupPage() {
   const [restoring, setRestoring] = useState(false);
   const [restoreTarget, setRestoreTarget] = useState<BackupItem | null>(null);
   const [confirmRestoreTarget, setConfirmRestoreTarget] = useState<BackupItem | null>(null);
+  const [confirmDeleteTarget, setConfirmDeleteTarget] = useState<BackupItem | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [backupProgress, setBackupProgress] = useState(0);
   const [backupMessage, setBackupMessage] = useState("Preparando backup...");
   const [retryMessage, setRetryMessage] = useState<string | null>(null);
   const [restoreProgress, setRestoreProgress] = useState(0);
   const [restoreMessage, setRestoreMessage] = useState("Preparando restauración...");
-  const [restoreResult, setRestoreResult] = useState<RestoreResponse | null>(null);
+  const [restoreJob, setRestoreJob] = useState<RestoreJobStatus | null>(null);
   const progressTimerRef = useRef<number | null>(null);
-  const restoreTimerRef = useRef<number | null>(null);
+  const restorePollerRef = useRef<number | null>(null);
 
   const stopProgressTimer = () => {
     if (progressTimerRef.current) {
@@ -138,10 +150,10 @@ export default function BackupPage() {
     }
   };
 
-  const stopRestoreTimer = () => {
-    if (restoreTimerRef.current) {
-      window.clearInterval(restoreTimerRef.current);
-      restoreTimerRef.current = null;
+  const stopRestorePoller = () => {
+    if (restorePollerRef.current) {
+      window.clearInterval(restorePollerRef.current);
+      restorePollerRef.current = null;
     }
   };
 
@@ -161,32 +173,10 @@ export default function BackupPage() {
     }, 700);
   };
 
-  const startRestoreTimer = () => {
-    stopRestoreTimer();
-    setRestoreProgress(6);
-    setRestoreMessage(getRestoreMessage(6));
-    restoreTimerRef.current = window.setInterval(() => {
-      setRestoreProgress((current) => {
-        if (current >= 94) {
-          return current;
-        }
-        const next = current < 40 ? current + 6 : current < 75 ? current + 4 : current + 2;
-        setRestoreMessage(getRestoreMessage(next));
-        return next;
-      });
-    }, 800);
-  };
-
   const finishProgress = () => {
     stopProgressTimer();
     setBackupProgress(100);
     setBackupMessage("Backup completado correctamente.");
-  };
-
-  const finishRestore = () => {
-    stopRestoreTimer();
-    setRestoreProgress(100);
-    setRestoreMessage("Restauración completada.");
   };
 
   const resetProgress = () => {
@@ -197,10 +187,10 @@ export default function BackupPage() {
   };
 
   const resetRestore = () => {
-    stopRestoreTimer();
+    stopRestorePoller();
     setRestoreProgress(0);
     setRestoreMessage("Preparando restauración...");
-    setRestoreResult(null);
+    setRestoreJob(null);
     setRestoreTarget(null);
   };
 
@@ -237,7 +227,7 @@ export default function BackupPage() {
     void loadBackups();
     return () => {
       stopProgressTimer();
-      stopRestoreTimer();
+      stopRestorePoller();
     };
   }, []);
 
@@ -254,6 +244,7 @@ export default function BackupPage() {
     setCreating(true);
     setRetryMessage(null);
     startProgressTimer();
+    const procId = addProcess({ type: "backup_create", label: "Crear backup", pollUrl: null });
 
     try {
       await apiRequest<BackupItem>(withTenantPath(activeTenant.id, "/backup"), {
@@ -267,22 +258,18 @@ export default function BackupPage() {
       });
 
       finishProgress();
+      finishProcess(procId, "completed");
       showToast("Backup creado correctamente");
       await loadBackups();
-      window.setTimeout(() => {
-        setCreating(false);
-        resetProgress();
-      }, 900);
+      window.setTimeout(() => { setCreating(false); resetProgress(); }, 900);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Error creando backup";
       stopProgressTimer();
       setRetryMessage(null);
       setBackupMessage(message);
+      finishProcess(procId, "failed", { error: message });
       showToast(message, "error");
-      window.setTimeout(() => {
-        setCreating(false);
-        resetProgress();
-      }, 1200);
+      window.setTimeout(() => { setCreating(false); resetProgress(); }, 1200);
     }
   };
 
@@ -353,43 +340,90 @@ export default function BackupPage() {
   };
 
   const confirmRestore = async () => {
-    if (!session || !confirmRestoreTarget) {
-      return;
-    }
+    if (!session || !confirmRestoreTarget) return;
     const activeTenant = resolveActiveTenant(session);
-    if (!activeTenant) {
-      showToast("Selecciona un cliente", "error");
-      return;
-    }
+    if (!activeTenant) { showToast("Selecciona un cliente", "error"); return; }
 
     const backup = confirmRestoreTarget;
     setConfirmRestoreTarget(null);
     setRestoreTarget(backup);
     setRestoring(true);
-    setRestoreResult(null);
-    startRestoreTimer();
+    setRestoreJob(null);
+    setRestoreProgress(0);
+    setRestoreMessage("Iniciando restauración...");
 
     try {
-      const response = await apiRequest<RestoreResponse>(withTenantPath(activeTenant.id, `/backups/${backup.id}/restore`), {
-        method: "POST"
+      const startResponse = await apiRequest<RestoreJobStatus>(
+        withTenantPath(activeTenant.id, `/backups/${backup.id}/restore`),
+        { method: "POST" }
+      );
+      const jobId = startResponse.data.job_id;
+      const procId = addProcess({
+        type: "restore",
+        label: `Restaurar ${backup.filename}`,
+        pollUrl: `/tenants/${activeTenant.id}/backups/restore-jobs/${jobId}`,
       });
-      finishRestore();
-      setRestoreResult(response.data);
-      showToast("Backup restaurado correctamente");
-      await loadBackups();
-      window.setTimeout(() => {
-        setRestoring(false);
-        resetRestore();
-      }, 1800);
+
+      stopRestorePoller();
+      restorePollerRef.current = window.setInterval(async () => {
+        try {
+          const jobResponse = await apiRequest<RestoreJobStatus>(
+            withTenantPath(activeTenant.id, `/backups/restore-jobs/${jobId}`),
+            { cache: "no-store", retryAttempts: 1 }
+          );
+          const job = jobResponse.data;
+          setRestoreJob(job);
+          setRestoreProgress(job.progress);
+
+          if (job.status === "running" || job.status === "pending") {
+            const batchInfo = job.total_batches > 0
+              ? `Lote ${job.current_batch} de ${job.total_batches}`
+              : "Preparando...";
+            const productInfo = job.current_product_name ? ` · ${job.current_product_name}` : "";
+            setRestoreMessage(`${batchInfo}${productInfo}`);
+          } else if (job.status === "completed") {
+            stopRestorePoller();
+            finishProcess(procId, "completed", { result: { updated: job.updated, failed: job.failed } });
+            setRestoreProgress(100);
+            setRestoreMessage(`Restauración completada — ${job.updated} actualizados, ${job.failed} fallidos`);
+            showToast("Backup restaurado correctamente");
+            await loadBackups();
+            window.setTimeout(() => { setRestoring(false); resetRestore(); }, 2000);
+          } else if (job.status === "failed") {
+            stopRestorePoller();
+            finishProcess(procId, "failed", { error: job.error ?? "La restauración falló" });
+            setRestoreMessage(job.error ?? "La restauración falló");
+            showToast(job.error ?? "No se pudo restaurar el backup", "error");
+            window.setTimeout(() => { setRestoring(false); resetRestore(); }, 2000);
+          }
+        } catch {
+          // red error — seguir intentando
+        }
+      }, 1500);
+
     } catch (err) {
-      const message = err instanceof Error ? err.message : "No se pudo restaurar el backup";
-      stopRestoreTimer();
+      const message = err instanceof Error ? err.message : "No se pudo iniciar la restauración";
       setRestoreMessage(message);
       showToast(message, "error");
-      window.setTimeout(() => {
-        setRestoring(false);
-        resetRestore();
-      }, 1800);
+      window.setTimeout(() => { setRestoring(false); resetRestore(); }, 1800);
+    }
+  };
+
+  const confirmDelete = async () => {
+    if (!session || !confirmDeleteTarget) return;
+    const activeTenant = resolveActiveTenant(session);
+    if (!activeTenant) return;
+    const backup = confirmDeleteTarget;
+    setConfirmDeleteTarget(null);
+    setDeleting(true);
+    try {
+      await apiRequest(withTenantPath(activeTenant.id, `/backups/${backup.id}`), { method: "DELETE" });
+      showToast("Backup eliminado");
+      await loadBackups();
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "No se pudo eliminar el backup", "error");
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -423,11 +457,15 @@ export default function BackupPage() {
                 Descargar backup
               </a>
               {allowRestore ? (
-                <Button className="rounded-xl" disabled={creating || importing || restoring} onClick={() => requestRestore(backup)} size="sm" variant="outline">
+                <Button className="rounded-xl" disabled={creating || importing || restoring || deleting} onClick={() => requestRestore(backup)} size="sm" variant="outline">
                   <RotateCcw className="mr-2 h-4 w-4" />
                   Restaurar
                 </Button>
               ) : null}
+              <Button className="rounded-xl" disabled={creating || importing || restoring || deleting} onClick={() => setConfirmDeleteTarget(backup)} size="sm" variant="outline">
+                <Trash2 className="mr-2 h-4 w-4" />
+                Eliminar
+              </Button>
             </div>
           </div>
         ))}
@@ -457,6 +495,7 @@ export default function BackupPage() {
               <th className="px-4 py-3 font-medium">Fecha</th>
               <th className="px-4 py-3 font-medium">Descarga</th>
               {allowRestore ? <th className="px-4 py-3 font-medium">Restaurar</th> : null}
+              <th className="px-4 py-3 font-medium">Eliminar</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-border bg-card">
@@ -473,12 +512,18 @@ export default function BackupPage() {
                 </td>
                 {allowRestore ? (
                   <td className="px-4 py-3 whitespace-nowrap">
-                    <Button disabled={creating || importing || restoring} onClick={() => requestRestore(backup)} size="sm" variant="outline">
+                    <Button disabled={creating || importing || restoring || deleting} onClick={() => requestRestore(backup)} size="sm" variant="outline">
                       <RotateCcw className="mr-2 h-4 w-4" />
                       Restaurar
                     </Button>
                   </td>
                 ) : null}
+                <td className="px-4 py-3 whitespace-nowrap">
+                  <Button disabled={creating || importing || restoring || deleting} onClick={() => setConfirmDeleteTarget(backup)} size="sm" variant="outline">
+                    <Trash2 className="mr-2 h-4 w-4" />
+                    Eliminar
+                  </Button>
+                </td>
               </tr>
             ))}
           </tbody>
@@ -604,6 +649,34 @@ export default function BackupPage() {
         </Card>
       </div>
 
+      {confirmDeleteTarget ? (
+        <div className="fixed inset-0 z-[58] flex items-center justify-center bg-slate-950/60 px-4 backdrop-blur-sm">
+          <div className="w-full max-w-xl rounded-3xl border border-border bg-card p-6 shadow-2xl sm:p-7">
+            <div className="flex items-start gap-4">
+              <div className="rounded-2xl bg-destructive/10 p-3 text-destructive">
+                <Trash2 className="h-6 w-6" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="text-xs uppercase tracking-[0.28em] text-muted-foreground">Confirmar eliminación</div>
+                <h2 className="mt-2 text-2xl font-semibold">Eliminar backup</h2>
+                <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                  Se eliminará <span className="font-medium text-foreground">{confirmDeleteTarget.filename}</span>. Esta acción no se puede deshacer.
+                </p>
+              </div>
+            </div>
+            <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+              <Button className="rounded-xl" onClick={() => setConfirmDeleteTarget(null)} variant="outline">
+                Cancelar
+              </Button>
+              <Button className="rounded-xl" onClick={() => void confirmDelete()} variant="destructive">
+                <Trash2 className="mr-2 h-4 w-4" />
+                Sí, eliminar
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {confirmRestoreTarget ? (
         <div className="fixed inset-0 z-[58] flex items-center justify-center bg-slate-950/60 px-4 backdrop-blur-sm">
           <div className="w-full max-w-xl rounded-3xl border border-border bg-card p-6 shadow-2xl sm:p-7">
@@ -653,6 +726,9 @@ export default function BackupPage() {
                 <h2 className="mt-2 text-2xl font-semibold">Creando respaldo</h2>
                 <p className="mt-2 text-sm leading-6 text-muted-foreground">{backupMessage}</p>
               </div>
+              <Button className="shrink-0 rounded-xl" onClick={() => setCreating(false)} size="icon" title="Minimizar — el proceso sigue en segundo plano" variant="ghost">
+                <X className="h-4 w-4" />
+              </Button>
             </div>
 
             <div className="mt-6 space-y-3">
@@ -713,41 +789,54 @@ export default function BackupPage() {
           <div className="w-full max-w-2xl rounded-3xl border border-border bg-card p-6 shadow-2xl sm:p-7">
             <div className="flex items-start gap-4">
               <div className="rounded-2xl bg-primary/10 p-3 text-primary">
-                <RotateCcw className="h-6 w-6 animate-spin" />
+                <RotateCcw className={`h-6 w-6 ${restoreJob?.status === "completed" || restoreJob?.status === "failed" ? "" : "animate-spin"}`} />
               </div>
               <div className="min-w-0 flex-1">
                 <div className="text-xs uppercase tracking-[0.28em] text-muted-foreground">Restauración en progreso</div>
                 <h2 className="mt-2 text-2xl font-semibold">Restaurando backup</h2>
-                <p className="mt-2 text-sm leading-6 text-muted-foreground">{restoreMessage}</p>
-                {restoreTarget ? <div className="mt-3 text-sm text-foreground">Backup seleccionado: {restoreTarget.filename}</div> : null}
+                {restoreTarget ? <div className="mt-1 truncate text-xs text-muted-foreground">{restoreTarget.filename}</div> : null}
               </div>
+              <Button
+                className="shrink-0 rounded-xl"
+                onClick={() => setRestoring(false)}
+                size="icon"
+                title="Minimizar — el proceso sigue en segundo plano"
+                variant="ghost"
+              >
+                <X className="h-4 w-4" />
+              </Button>
             </div>
 
-            <div className="mt-6 space-y-3">
+            <div className="mt-5 space-y-2">
               <div className="flex items-center justify-between text-sm">
-                <span className="text-muted-foreground">Progreso estimado</span>
-                <span className="font-medium">{restoreProgress}%</span>
+                <span className="font-medium text-foreground">{restoreMessage}</span>
+                <span className="tabular-nums text-muted-foreground">{restoreProgress}%</span>
               </div>
               <Progress className="h-3" value={restoreProgress} />
+              {restoreJob && restoreJob.total_batches > 0 ? (
+                <div className="flex justify-between text-xs text-muted-foreground">
+                  <span>Lote {restoreJob.current_batch} / {restoreJob.total_batches}</span>
+                  <span>{restoreJob.updated} actualizados · {restoreJob.failed} fallidos · {restoreJob.total_products} total</span>
+                </div>
+              ) : null}
             </div>
 
-            <div className="mt-6 rounded-2xl border border-border bg-background/70 p-4 text-sm text-muted-foreground">
+            {restoreJob?.current_product_name && restoreJob.status === "running" ? (
+              <div className="mt-4 rounded-2xl border border-border bg-background/70 px-4 py-3 text-sm">
+                <span className="text-muted-foreground">Procesando: </span>
+                <span className="font-medium text-foreground">{restoreJob.current_product_name}</span>
+              </div>
+            ) : null}
+
+            <div className="mt-4 rounded-2xl border border-border bg-background/70 p-4 text-sm text-muted-foreground">
               <div className="flex items-start gap-3">
                 <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
                 <div>
-                  <div className="font-medium text-foreground">Seguridad antes de restaurar</div>
-                  <div className="mt-2">Antes de aplicar el backup elegido, WooLas guarda un backup de seguridad del estado actual para que puedas volver atrás si hace falta.</div>
+                  <div className="font-medium text-foreground">Backup de seguridad automático</div>
+                  <div className="mt-1">WooLas guardó el estado actual antes de restaurar. Puedes volver atrás desde el historial inferior.</div>
                 </div>
               </div>
             </div>
-
-            {restoreResult ? (
-              <div className="mt-4 rounded-2xl border border-border bg-background/70 p-4 text-sm text-muted-foreground">
-                <div className="font-medium text-foreground">Resultado</div>
-                <div className="mt-2">{restoreResult.updated} actualizados, {restoreResult.failed} fallidos, {restoreResult.total_products} productos procesados.</div>
-                <div className="mt-2">Backup de seguridad guardado: {restoreResult.safety_backup.filename}</div>
-              </div>
-            ) : null}
           </div>
         </div>
       ) : null}

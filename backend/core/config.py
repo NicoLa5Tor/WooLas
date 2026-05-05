@@ -13,8 +13,16 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "WooLas"
-    frontend_origin: str = Field(default="http://localhost:3000", alias="FRONTEND_ORIGIN")
-    next_public_api_url: str = Field(default="http://localhost:8000", alias="NEXT_PUBLIC_API_URL")
+
+    frontend_origin: str = Field(
+        default="http://localhost:3000",
+        alias="FRONTEND_ORIGIN"
+    )
+
+    next_public_api_url: str = Field(
+        default="http://localhost:8000",
+        alias="NEXT_PUBLIC_API_URL"
+    )
 
     jwt_secret: str = Field(alias="JWT_SECRET")
     access_token_expire_hours: int = 8
@@ -27,9 +35,22 @@ class Settings(BaseSettings):
     fernet_key: str = Field(alias="FERNET_KEY")
 
     database_url: str = Field(alias="DATABASE_URL")
-    backups_dir: Path = Field(default=Path("/backups"), alias="BACKUPS_DIR")
-    imports_dir: Path = Field(default=Path("/data/imports"), alias="IMPORTS_DIR")
-    media_cache_ttl_minutes: int = Field(default=15, alias="MEDIA_CACHE_TTL_MINUTES")
+
+    # Rutas locales seguras para desarrollo
+    backups_dir: Path = Field(
+        default=Path("./backups"),
+        alias="BACKUPS_DIR"
+    )
+
+    imports_dir: Path = Field(
+        default=Path("./data/imports"),
+        alias="IMPORTS_DIR"
+    )
+
+    media_cache_ttl_minutes: int = Field(
+        default=15,
+        alias="MEDIA_CACHE_TTL_MINUTES"
+    )
 
 
 @lru_cache
@@ -38,8 +59,15 @@ def get_settings() -> Settings:
 
 
 def ensure_storage_dirs() -> None:
-    settings.backups_dir.mkdir(parents=True, exist_ok=True)
-    settings.imports_dir.mkdir(parents=True, exist_ok=True)
+    """
+    Crea directorios de almacenamiento solo si están configurados.
+    Usa rutas relativas por defecto para evitar errores de permisos en /backups o /data.
+    """
+    if settings.backups_dir:
+        settings.backups_dir.mkdir(parents=True, exist_ok=True)
+
+    if settings.imports_dir:
+        settings.imports_dir.mkdir(parents=True, exist_ok=True)
 
 
 settings = get_settings()

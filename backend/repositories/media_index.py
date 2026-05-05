@@ -1,15 +1,45 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from models.media_index import MediaIndexRecord
 
 
 def list_media_index_records(db: Session, tenant_id: UUID) -> list[MediaIndexRecord]:
-    stmt = select(MediaIndexRecord).where(MediaIndexRecord.tenant_id == tenant_id).order_by(MediaIndexRecord.media_id.asc())
+    stmt = select(MediaIndexRecord).where(MediaIndexRecord.tenant_id == tenant_id).order_by(MediaIndexRecord.uploaded_at.desc())
     return list(db.execute(stmt).scalars().all())
+
+
+def list_media_index_records_paginated(
+    db: Session,
+    tenant_id: UUID,
+    *,
+    page: int = 1,
+    per_page: int = 50,
+    search: str | None = None,
+) -> tuple[list[MediaIndexRecord], int]:
+    base = select(MediaIndexRecord).where(MediaIndexRecord.tenant_id == tenant_id)
+    if search:
+        term = f"%{search.strip().lower()}%"
+        base = base.where(
+            or_(
+                func.lower(MediaIndexRecord.filename).like(term),
+                func.lower(MediaIndexRecord.title).like(term),
+                func.lower(MediaIndexRecord.slug).like(term),
+            )
+        )
+    count_stmt = select(func.count()).select_from(base.subquery())
+    total: int = db.execute(count_stmt).scalar_one()
+    items_stmt = base.order_by(MediaIndexRecord.uploaded_at.desc()).offset((page - 1) * per_page).limit(per_page)
+    items = list(db.execute(items_stmt).scalars().all())
+    return items, total
+
+
+def count_media_index_records(db: Session, tenant_id: UUID) -> int:
+    stmt = select(func.count()).where(MediaIndexRecord.tenant_id == tenant_id)
+    return db.execute(stmt).scalar_one()
 
 
 def get_media_index_record(db: Session, tenant_id: UUID, media_id: int) -> MediaIndexRecord | None:

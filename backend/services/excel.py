@@ -292,16 +292,26 @@ def _row_has_field(row: dict[str, str], field: str) -> bool:
 
 def _product_matcher(products: list[dict[str, Any]]):
     products_by_id = {int(product["id"]): product for product in products if str(product.get("id", "")).isdigit()}
-    products_by_sku = {str(product.get("sku", "")): product for product in products if product.get("sku")}
+    products_by_sku: dict[str, list[dict]] = {}
+    for p in products:
+        s = str(p.get("sku", "")).strip()
+        if s:
+            products_by_sku.setdefault(s, []).append(p)
 
-    def matcher(row: dict[str, str]):
+    # Returns (product | None, identifier_str, sku_candidates_if_ambiguous)
+    def matcher(row: dict[str, str]) -> tuple[dict | None, str, list[dict]]:
         sku = row.get("sku", "").strip()
         product_id = row.get("product_id", "").strip()
         if sku:
-            return products_by_sku.get(sku), sku
+            candidates = products_by_sku.get(sku, [])
+            if len(candidates) == 1:
+                return candidates[0], sku, []
+            if len(candidates) > 1:
+                return None, sku, candidates  # ambiguous — caller must resolve
+            return None, sku, []
         if product_id.isdigit():
-            return products_by_id.get(int(product_id)), product_id
-        return None, sku or product_id or "sin identificador"
+            return products_by_id.get(int(product_id)), product_id, []
+        return None, sku or product_id or "sin identificador", []
 
     return matcher
 
@@ -424,11 +434,19 @@ async def generate_bulk_preview(
     rows: list[dict[str, str]],
     selected_fields: list[str],
     products: list[dict[str, Any]],
+    product_id_overrides: dict[int, int] | None = None,
 ) -> dict[str, Any]:
     matcher = _product_matcher(products)
+    products_by_id = {int(p["id"]): p for p in products if str(p.get("id", "")).isdigit()}
     preview_rows: list[dict[str, Any]] = []
     for row_index, row in enumerate(rows):
-        product, identifier = matcher(row)
+        # Apply user-chosen override for ambiguous rows
+        if product_id_overrides and row_index in product_id_overrides:
+            row = {**row, "product_id": str(product_id_overrides[row_index]), "sku": ""}
+        product, identifier, sku_candidates = matcher(row)
+        # If override given but not found via sku="" path, look up by id directly
+        if product is None and product_id_overrides and row_index in product_id_overrides:
+            product = products_by_id.get(product_id_overrides[row_index])
         changed_fields = [field for field in selected_fields if _row_has_field(row, field)]
         changes = [
             {
@@ -452,6 +470,11 @@ async def generate_bulk_preview(
                 "changed_fields": changed_fields,
                 "changes": changes,
                 "row_data": row,
+                "ambiguous": len(sku_candidates) > 0,
+                "sku_candidates": [
+                    {"id": c.get("id"), "name": c.get("name"), "sku": c.get("sku")}
+                    for c in sku_candidates
+                ],
             }
         )
 
@@ -486,14 +509,23 @@ async def build_bulk_update_summary(
         batch_payload = [{key: value for key, value in item.items() if not key.startswith("_")} for item in batch]
         try:
             result = await woo_service.batch_update(batch_payload)
-            batch_updates = result.get("update", [])
-            updated += len(batch_updates)
-            updated_products.extend(batch_updates)
-            for failed in result.get("not_updated", []):
-                errors.append({"identifier": str(failed.get("id", "unknown")), "error": failed.get("error", {}).get("message", "Update failed")})
+            # WC returns ALL sent products in "update" — including failures as error objects.
+            # A failed product has a "code" field (WC error code) instead of product fields.
+            # We must separate good responses from error responses.
+            for item in result.get("update", []):
+                if "code" in item and "message" in item:
+                    # WC-level error for this specific product
+                    identifier = str(item.get("data", {}).get("id") or item.get("id") or "desconocido")
+                    errors.append({"identifier": identifier, "error": item.get("message", "Error de WooCommerce")})
+                elif item.get("id"):
+                    updated += 1
+                    updated_products.append(item)
+                else:
+                    # Unexpected shape — count as error, don't corrupt backup
+                    errors.append({"identifier": "desconocido", "error": f"Respuesta inesperada de WooCommerce: {str(item)[:120]}"})
         except Exception as exc:
             for item in batch:
-                errors.append({"identifier": str(item["id"]), "error": str(exc)})
+                errors.append({"identifier": str(item.get("_identifier") or item.get("id", "?")), "error": str(exc)})
 
     return UpdateSummary(updated=updated, failed=len(errors), errors=errors, total_rows=len(selected_rows)), updated_products
 
@@ -506,6 +538,7 @@ async def prepare_bulk_update_payloads(
     resolve_media_names=None,
     selected_row_indexes: list[int] | None = None,
     on_row_progress=None,
+    product_id_overrides: dict[int, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]], list[tuple[int, dict[str, str]]]]:
     matcher = _product_matcher(products)
     update_payloads: list[dict[str, Any]] = []
@@ -518,7 +551,10 @@ async def prepare_bulk_update_payloads(
     selected_rows = [(row_index, row) for row_index, row in enumerate(rows) if row_index in selected_indexes]
 
     for row_index, row in selected_rows:
-        product, identifier = matcher(row)
+        # Apply user-chosen product when SKU was ambiguous
+        if product_id_overrides and row_index in product_id_overrides:
+            row = {**row, "product_id": str(product_id_overrides[row_index]), "sku": ""}
+        product, identifier, sku_candidates = matcher(row)
         if on_row_progress is not None:
             await on_row_progress(
                 stage="preparing",
@@ -527,7 +563,10 @@ async def prepare_bulk_update_payloads(
                 product=None if not product else product.get("name"),
             )
         if not product:
-            errors.append({"identifier": identifier, "error": "Product not found"})
+            if sku_candidates:
+                errors.append({"identifier": identifier, "error": f"SKU ambiguo: {len(sku_candidates)} productos comparten este SKU. Selecciona uno manualmente."})
+            else:
+                errors.append({"identifier": identifier, "error": "Producto no encontrado"})
             continue
         try:
             payload = await _build_row_payload(row, selected_fields, resolve_media_names=resolve_media_names)

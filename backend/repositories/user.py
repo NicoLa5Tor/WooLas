@@ -3,7 +3,7 @@ from uuid import UUID
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session, joinedload
 
-from models.tenant import Tenant, UserTenant
+from models.tenant import Tenant, UserTenant  # noqa: F401 – Tenant used in delete_tenant
 from models.user import Role, User
 
 
@@ -150,3 +150,13 @@ def get_client_account(db: Session, user_id: UUID) -> tuple[User, UserTenant, Te
         .where(User.id == user_id, User.is_superadmin.is_(False), UserTenant.role == Role.CLIENT)
     )
     return db.execute(stmt).first()
+
+
+def delete_user(db: Session, user: User) -> None:
+    db.delete(user)
+    db.flush()
+
+
+def delete_tenant(db: Session, tenant: Tenant) -> None:
+    db.delete(tenant)
+    db.flush()

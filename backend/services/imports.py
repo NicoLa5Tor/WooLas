@@ -588,12 +588,38 @@ def refactor_import_draft(
     )
 
 
-async def preview_import_draft(*, db: Session, tenant_id: UUID, selected_fields: list[str], products: list[dict]):
+async def preview_import_draft(
+    *,
+    db: Session,
+    tenant_id: UUID,
+    selected_fields: list[str],
+    products: list[dict],
+    product_id_overrides: dict[int, int] | None = None,
+):
     _, file_bytes = get_current_import_draft_bytes(db, tenant_id)
     headers, rows = excel_service.parse_excel(file_bytes)
     excel_service.validate_selected_fields(headers, selected_fields)
-    preview = await excel_service.generate_bulk_preview(rows=rows, selected_fields=selected_fields, products=products)
+    preview = await excel_service.generate_bulk_preview(
+        rows=rows,
+        selected_fields=selected_fields,
+        products=products,
+        product_id_overrides=product_id_overrides,
+    )
     return {"headers": headers, **preview}
+
+
+def _row_split_values(value: str) -> list[str]:
+    return [item.strip() for item in re.split(r"[;,\n]+", str(value)) if item.strip()]
+
+
+def _row_split_int_values(value: str) -> list[int]:
+    parsed: list[int] = []
+    for item in _row_split_values(value):
+        try:
+            parsed.append(int(float(item)))
+        except ValueError:
+            pass
+    return parsed
 
 
 async def _run_import_images_job(
@@ -605,9 +631,6 @@ async def _run_import_images_job(
     selected_row_indexes: list[int] | None,
     products: list[dict],
     credentials: dict[str, str],
-    wp_url: str,
-    wp_user: str,
-    wp_app_password: str,
 ):
     from core.database import SessionLocal
     from repositories import backup as backup_repository
@@ -622,156 +645,127 @@ async def _run_import_images_job(
 
     try:
         job.status = "running"
-        job.stage = "indexing"
-        job.current_identifier = "Preparando imágenes"
-        job.current_product_name = "Cargando media library y resolviendo nombres"
+        job.stage = "preparing"
+        job.progress = 2
         job_db = SessionLocal()
 
-        async def on_media_progress(*, processed_pages: int, total_pages: int, from_cache: bool):
-            if from_cache:
-                job.stage = "indexing"
-                job.current_identifier = "Media library lista"
-                job.current_product_name = "Usando caché local de imágenes"
-                return
-            job.stage = "indexing"
-            job.current_identifier = "Cargando media library"
-            job.current_product_name = f"Descargando páginas {processed_pages} de {total_pages}"
-            preload_progress = 5 if total_pages <= 0 else min(20, int((processed_pages / max(total_pages, 1)) * 20))
-            job.progress = preload_progress
-
-        media_items = await media_service.fetch_all_media_library_items(
-            wp_url=wp_url,
-            wp_user=wp_user,
-            wp_app_password=wp_app_password,
-            db=job_db,
-            tenant_id=tenant_id,
-            on_progress=on_media_progress,
-        )
-        job.stage = "indexing"
-        job.current_identifier = "Biblioteca de imágenes lista"
-        job.current_product_name = f"Se cargaron {len(media_items)} imágenes para esta importación"
-        job.progress = 20
-        media_lookup = media_service.build_media_lookup(media_items)
-        media_resolution_cache: dict[str, dict] = {}
-
-        async def resolve_media_names(names: list[str]) -> list[dict]:
-            resolved: list[dict] = []
-            missing_names = [name for name in names if name not in media_resolution_cache]
-            if missing_names:
-                fetched = media_service.resolve_media_names_from_items(
-                    names=missing_names,
-                    items=media_items,
-                    media_lookup=media_lookup,
-                )
-                for entry in fetched:
-                    media_resolution_cache[entry["requested"]] = entry
-            for name in names:
-                cached_entry = media_resolution_cache.get(name)
-                if cached_entry is not None:
-                    resolved.append(cached_entry)
-            return resolved
-
+        # 1. Construir lista de productos a procesar
         selected_indexes = set(range(len(rows))) if selected_row_indexes is None else set(selected_row_indexes)
-        products_by_id = {int(product["id"]): product for product in products if str(product.get("id", "")).isdigit()}
-        products_by_sku = {str(product.get("sku", "")): product for product in products if product.get("sku")}
-        matched_rows = []
+        products_by_id = {int(p["id"]): p for p in products if str(p.get("id", "")).isdigit()}
+        # SKUs can be duplicated → map each SKU to a list of products
+        products_by_sku: dict[str, list[dict]] = {}
+        for p in products:
+            s = str(p.get("sku", "")).strip()
+            if s:
+                products_by_sku.setdefault(s, []).append(p)
+
+        def _resolve_by_sku(sku: str, name_hint: str) -> dict | None:
+            candidates = products_by_sku.get(sku)
+            if not candidates:
+                return None
+            if len(candidates) == 1:
+                return candidates[0]
+            # Multiple products share this SKU — pick best name match
+            if name_hint:
+                hint_lower = name_hint.lower()
+                for c in candidates:
+                    if str(c.get("name", "")).lower() == hint_lower:
+                        return c
+                # Partial match fallback
+                for c in candidates:
+                    if hint_lower in str(c.get("name", "")).lower():
+                        return c
+            return candidates[0]
+
+        matched: list[tuple[ImportImagesJobRowStatus, dict[str, str], dict]] = []
         for row_index, row in enumerate(rows):
             if row_index not in selected_indexes:
                 continue
             sku = row.get("sku", "").strip()
-            product_id = row.get("product_id", "").strip()
-            product = None
-            identifier = sku or product_id or "sin identificador"
+            product_id_raw = row.get("product_id", "").strip()
+            name_hint = row.get("name", "").strip()
+            identifier = sku or product_id_raw or "sin identificador"
             if sku:
-                product = products_by_sku.get(sku)
-            elif product_id.isdigit():
-                product = products_by_id.get(int(product_id))
-            if product is not None:
-                matched_rows.append(
-                    ImportImagesJobRowStatus(
-                        row_index=row_index,
-                        identifier=identifier,
-                        product_id=int(product["id"]) if product.get("id") is not None else None,
-                        product_name=str(product.get("name") or "") or None,
-                    )
-                )
-        job.rows = matched_rows
-        total_selected = max(len(matched_rows), 1)
+                product = _resolve_by_sku(sku, name_hint)
+                sku_candidates = products_by_sku.get(sku, [])
+                if product is None:
+                    result.failed += 1
+                    result.errors.append({"identifier": identifier, "error": "Producto no encontrado en el backup"})
+                    continue
+                if len(sku_candidates) > 1 and name_hint:
+                    # Record which product was selected when SKU was ambiguous
+                    identifier = f"{sku} ({product.get('name', '')})"
+            else:
+                product = products_by_id.get(int(product_id_raw)) if product_id_raw.isdigit() else None
+                if product is None:
+                    result.failed += 1
+                    result.errors.append({"identifier": identifier, "error": "Producto no encontrado en el backup"})
+                    continue
+            row_status = ImportImagesJobRowStatus(
+                row_index=row_index,
+                identifier=identifier,
+                product_id=int(product["id"]),
+                product_name=str(product.get("name") or "") or None,
+            )
+            matched.append((row_status, row, product))
 
-        async def on_prepare_progress(*, stage: str, row_index: int, identifier: str, product: str | None = None, error: str | None = None):
-            row_status = next((item for item in job.rows if item.row_index == row_index), None)
-            if row_status is None:
-                return
-            ordinal = next((index for index, item in enumerate(job.rows, start=1) if item.row_index == row_index), 0)
-            if stage == "preparing":
-                job.stage = "preparing"
-                row_status.status = "running"
-                row_status.error = None
-                job.current_identifier = f"Preparando {ordinal} de {len(job.rows)}"
-                job.current_product_name = product or identifier
-                job.progress = min(60, 20 + int(ordinal * 40 / total_selected))
-            elif stage == "prepared":
-                job.stage = "preparing"
-                row_status.status = "pending"
-                job.prepared = max(job.prepared, ordinal)
-                job.current_identifier = f"Fila preparada {ordinal} de {len(job.rows)}"
-                job.current_product_name = product or identifier
-                job.progress = min(60, 20 + int(ordinal * 40 / total_selected))
-            elif stage == "failed":
-                job.stage = "preparing"
-                row_status.status = "failed"
-                row_status.error = error
-                job.current_identifier = f"Falló preparación {ordinal} de {len(job.rows)}"
-                job.current_product_name = product or identifier
+        job.rows = [rs for rs, _, _ in matched]
+        job.total = len(matched)
+        result.total_rows = len(matched)
+        job.stage = "updating"
 
-        payloads, preparation_errors, selected_rows = await excel_service.prepare_bulk_update_payloads(
-            rows=rows,
-            selected_fields=["images"],
-            products=products,
-            resolve_media_names=resolve_media_names,
-            selected_row_indexes=selected_row_indexes,
-            on_row_progress=on_prepare_progress,
-        )
-        result.failed += len(preparation_errors)
-        result.errors.extend(preparation_errors)
-        result.total_rows = len(selected_rows)
-        job.total = len(payloads)
-
-        for index, payload in enumerate(payloads, start=1):
-            identifier = str(payload.pop("_identifier", payload.get("id", "sin identificador")))
-            row_index = int(payload.pop("_row_index", index - 1))
-            product_name = payload.pop("_product_name", None)
-            product_id = int(payload.get("id")) if payload.get("id") is not None else None
-
-            row_status = next((item for item in job.rows if item.row_index == row_index), None)
-            if row_status is None:
-                row_status = ImportImagesJobRowStatus(
-                    row_index=row_index,
-                    identifier=identifier,
-                    product_id=product_id,
-                    product_name=product_name,
-                )
-                job.rows.append(row_status)
-
+        # 2. Procesar uno por uno — secuencial para no saturar WooCommerce
+        for index, (row_status, row, product) in enumerate(matched):
+            identifier = row_status.identifier
             row_status.status = "running"
-            job.stage = "updating"
-            job.current_identifier = f"Actualizando {index} de {len(payloads)}"
-            job.current_product_name = product_name or identifier
-            job.progress = 60 + int((max(index - 1, 0) * 40) / max(len(payloads), 1))
+            job.processed = index
+            job.progress = int(index * 100 / max(job.total, 1))
+            job.current_product_name = row_status.product_name or identifier
 
             try:
-                updated_product = await woo_service.update_product(int(payload["id"]), payload)
-                updated_products.append(updated_product)
-                result.updated += 1
+                principal_raw = str(row.get("image_principal_id", "")).strip()
+                gallery_raw = str(row.get("image_galeria_ids", "")).strip()
+                names_raw = str(row.get("image_nombres", "")).strip()
+
+                if principal_raw or gallery_raw:
+                    image_ids = list(dict.fromkeys(
+                        i for i in _row_split_int_values(principal_raw) + _row_split_int_values(gallery_raw)
+                        if i > 0
+                    ))
+                elif names_raw:
+                    resolved = media_service.resolve_media_by_names_from_index(
+                        db=job_db, tenant_id=tenant_id, names=_row_split_values(names_raw)
+                    )
+                    image_ids = [int(r["item"]["id"]) for r in resolved if r.get("matched") and r.get("item") and int(r["item"]["id"]) > 0]
+                else:
+                    image_ids = []
+
+                if not image_ids:
+                    row_status.status = "skipped"
+                    if not principal_raw and not gallery_raw and not names_raw:
+                        row_status.error = "Sin datos de imagen en esta fila"
+                    elif names_raw:
+                        tried = _row_split_values(names_raw)
+                        row_status.error = f"No se encontró en el índice: {', '.join(tried[:2])}{'...' if len(tried) > 2 else ''}"
+                    else:
+                        row_status.error = "Los IDs de imagen no son válidos (¿todos cero?)"
+                    result.skipped += 1
+                    continue
+
+                payload = {"id": product["id"], "images": [{"id": img_id} for img_id in image_ids]}
+                updated_product = await woo_service.update_product(int(product["id"]), payload)
+
                 row_status.status = "completed"
+                result.updated += 1
+                updated_products.append(updated_product)
+
             except Exception as exc:
                 row_status.status = "failed"
                 row_status.error = str(exc)
                 result.failed += 1
                 result.errors.append({"identifier": identifier, "error": str(exc)})
 
-            job.processed = index
-            job.progress = 60 + int(index * 40 / max(len(payloads), 1))
+        job.processed = job.total
 
         if updated_products:
             backup_record = backup_repository.get_backup_for_tenant(job_db, tenant_id, backup_id)
@@ -783,8 +777,8 @@ async def _run_import_images_job(
         job.status = "completed"
         job.stage = "completed"
         job.progress = 100
-        job.current_identifier = None
         job.current_product_name = None
+
     except Exception as exc:
         job.status = "failed"
         job.stage = "failed"
@@ -811,6 +805,7 @@ async def apply_import_draft(
     backup_record,
     woo_service,
     credentials: dict[str, str],
+    product_id_overrides: dict[int, int] | None = None,
     wp_url: str | None = None,
     wp_user: str | None = None,
     wp_app_password: str | None = None,
@@ -818,6 +813,14 @@ async def apply_import_draft(
     _, file_bytes = get_current_import_draft_bytes(db, tenant_id)
     headers, rows = excel_service.parse_excel(file_bytes)
     excel_service.validate_selected_fields(headers, selected_fields)
+
+    # Patch rows where user resolved an ambiguous SKU manually
+    if product_id_overrides:
+        rows = [
+            {**row, "product_id": str(product_id_overrides[i]), "sku": ""} if i in product_id_overrides else row
+            for i, row in enumerate(rows)
+        ]
+
     non_image_fields = [field for field in selected_fields if field != "images"]
     image_fields = ["images"] if "images" in selected_fields else []
 
@@ -847,8 +850,7 @@ async def apply_import_draft(
     if not image_fields:
         return response_summary.model_dump()
 
-    if not wp_url or not wp_user or not wp_app_password:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Este cliente no tiene credenciales de WordPress para resolver nombres de imagen")
+    media_service.require_fresh_media_index(db, backup_record.tenant_id)
 
     job_id = str(uuid.uuid4())
     import_apply_jobs[job_id] = ImportImagesJobStatus(
@@ -866,9 +868,6 @@ async def apply_import_draft(
             selected_row_indexes=selected_row_indexes,
             products=products,
             credentials=credentials,
-            wp_url=wp_url,
-            wp_user=wp_user,
-            wp_app_password=wp_app_password,
         )
     )
     return {

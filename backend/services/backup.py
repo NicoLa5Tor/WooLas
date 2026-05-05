@@ -1,10 +1,14 @@
+import asyncio
 import json
 import re
+import uuid as _uuid_mod
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from repositories import backup as backup_repository
@@ -268,6 +272,121 @@ def list_backups(db: Session, tenant_id) -> dict:
         "active_backups": [_serialize_backup_record(backup) for backup in active_backups],
         "restore_backups": [_serialize_backup_record(backup) for backup in restore_backups],
     }
+
+
+def delete_backup(db: Session, tenant_id, backup_id) -> None:
+    record = backup_repository.get_backup_for_tenant(db, tenant_id, backup_id)
+    if not record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Backup no encontrado")
+    backup_repository.delete_backup_record(db, record)
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Restore background job
+# ---------------------------------------------------------------------------
+
+class RestoreJobStatus(BaseModel):
+    job_id: str
+    status: str = "pending"  # pending | running | completed | failed
+    progress: int = 0
+    current_batch: int = 0
+    total_batches: int = 0
+    current_product_name: str | None = None
+    updated: int = 0
+    failed: int = 0
+    total_products: int = 0
+    errors: list[dict[str, str]] = Field(default_factory=list)
+    safety_backup_id: str | None = None
+    error: str | None = None
+
+
+restore_jobs: dict[str, RestoreJobStatus] = {}
+
+
+async def _run_restore_job(
+    *,
+    job_id: str,
+    tenant_id: UUID,
+    backup_id: UUID,
+    credentials: dict[str, str],
+) -> None:
+    from core.database import SessionLocal
+    from services.woocommerce import WooCommerceService
+
+    job = restore_jobs[job_id]
+    db = None
+    try:
+        job.status = "running"
+        db = SessionLocal()
+
+        target_record = backup_repository.get_backup_for_tenant(db, tenant_id, backup_id)
+        if not target_record:
+            raise ValueError("Backup no encontrado")
+
+        # safety backup before restore
+        from models.tenant import Tenant as TenantModel
+        tenant = db.query(TenantModel).filter_by(id=tenant_id).first()
+        woo_service = WooCommerceService(**credentials)
+
+        safety_backup = await create_backup(
+            db,
+            tenant,
+            woo_service,
+            preserve_backup_ids={target_record.id},
+            filename_prefix="pre_restore_backup",
+            backup_kind=BACKUP_KIND_SAFETY_RESTORE,
+        )
+        job.safety_backup_id = str(safety_backup["id"])
+
+        products: list[dict[str, Any]] = target_record.payload or []
+        job.total_products = len(products)
+        total_batches = max(1, -(-len(products) // RESTORE_BATCH_SIZE))  # ceil div
+        job.total_batches = total_batches
+
+        for batch_index, start in enumerate(range(0, len(products), RESTORE_BATCH_SIZE)):
+            chunk = products[start : start + RESTORE_BATCH_SIZE]
+            job.current_batch = batch_index + 1
+            job.progress = int(batch_index * 100 / total_batches)
+            if chunk:
+                job.current_product_name = str(chunk[0].get("name") or chunk[0].get("sku") or "")
+
+            payload = [_build_restore_payload(p) for p in chunk]
+            response = await woo_service.batch_update(payload)
+            updated_items = response.get("update", [])
+            error_items = response.get("error", [])
+            job.updated += len(updated_items)
+            job.failed += len(error_items)
+            for item in error_items:
+                job.errors.append({
+                    "identifier": str(item.get("id") or item.get("sku") or "desconocido"),
+                    "error": item.get("error", "No se pudo restaurar"),
+                })
+
+        job.progress = 100
+        job.status = "completed"
+        job.current_product_name = None
+
+    except Exception as exc:
+        job.status = "failed"
+        job.error = str(exc)
+    finally:
+        if db is not None:
+            db.close()
+
+
+def start_restore_job(*, tenant_id: UUID, backup_id: UUID, credentials: dict[str, str]) -> RestoreJobStatus:
+    job_id = str(_uuid_mod.uuid4())
+    job = RestoreJobStatus(job_id=job_id, status="pending")
+    restore_jobs[job_id] = job
+    asyncio.create_task(
+        _run_restore_job(job_id=job_id, tenant_id=tenant_id, backup_id=backup_id, credentials=credentials)
+    )
+    return job
+
+
+def get_restore_job(job_id: str) -> RestoreJobStatus | None:
+    return restore_jobs.get(job_id)
 
 
 def get_backup_file(db: Session, tenant_id, backup_id) -> tuple[Path, str]:

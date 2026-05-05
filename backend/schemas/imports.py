@@ -32,6 +32,7 @@ class ImportRefactorPayload(BaseModel):
 class ImportApplyResult(BaseModel):
     updated: int = 0
     failed: int = 0
+    skipped: int = 0
     errors: list[dict[str, str]] = Field(default_factory=list)
     total_rows: int = 0
 
@@ -41,14 +42,14 @@ class ImportImagesJobRowStatus(BaseModel):
     identifier: str
     product_id: int | None = None
     product_name: str | None = None
-    status: Literal["pending", "running", "completed", "failed"] = "pending"
+    status: Literal["pending", "running", "completed", "failed", "skipped"] = "pending"
     error: str | None = None
 
 
 class ImportImagesJobStatus(BaseModel):
     job_id: str
     status: Literal["pending", "running", "completed", "failed"]
-    stage: Literal["pending", "indexing", "preparing", "updating", "completed", "failed"] = "pending"
+    stage: Literal["pending", "preparing", "updating", "completed", "failed"] = "pending"
     progress: int = 0
     prepared: int = 0
     processed: int = 0

@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -28,3 +29,14 @@ class MediaResolveResult(BaseModel):
     requested: str
     matched: bool
     item: MediaItem | None = None
+
+
+class MediaSyncJobStatus(BaseModel):
+    job_id: str
+    status: Literal["pending", "running", "completed", "failed"]
+    processed_pages: int = 0
+    total_pages: int = 0
+    total_items: int = 0
+    from_cache: bool = False
+    progress: int = 0
+    error: str | None = None

@@ -1,6 +1,6 @@
 "use client";
 
-import { ImagePlus, LoaderCircle, Search, UploadCloud } from "lucide-react";
+import { DatabaseZap, ImagePlus, LoaderCircle, Search, UploadCloud } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -13,17 +13,21 @@ export function MediaLibraryBrowser({
   tenantId,
   mode = "page",
   selectedIds = [],
-  onSelect
+  onSelect,
+  onSyncRequest,
 }: {
   tenantId: string;
   mode?: "page" | "picker";
   selectedIds?: number[];
   onSelect?: (item: MediaItem) => void;
+  onSyncRequest?: () => void;
 }) {
   const { showToast } = useToast();
   const [items, setItems] = useState<MediaItem[]>([]);
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
+  const [total, setTotal] = useState(0);
+  const [fromIndex, setFromIndex] = useState(false);
   const [search, setSearch] = useState("");
   const [searchTerm, setSearchTerm] = useState("");
   const [loading, setLoading] = useState(true);
@@ -45,10 +49,12 @@ export function MediaLibraryBrowser({
       if (searchTerm) {
         query.set("search", searchTerm);
       }
-      const response = await apiRequest<MediaListResponse>(`${withTenantPath(tenantId, "/media")}?${query.toString()}`, { cache: "no-store" });
+      const response = await apiRequest<MediaListResponse & { from_index?: boolean }>(`${withTenantPath(tenantId, "/media")}?${query.toString()}`, { cache: "no-store" });
       setItems((current) => (append ? [...current, ...response.data.items] : response.data.items));
       setPage(response.data.page);
       setTotalPages(response.data.total_pages);
+      setTotal(response.data.total);
+      setFromIndex(response.data.from_index ?? false);
     } catch (err) {
       const message = err instanceof Error ? err.message : "No se pudo cargar la biblioteca de imágenes";
       setError(message);
@@ -95,6 +101,15 @@ export function MediaLibraryBrowser({
           </Button>
         </div>
       </div>
+
+      {!loading && total > 0 ? (
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <span className={["rounded-full px-2 py-0.5 font-medium", fromIndex ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400" : "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"].join(" ")}>
+            {fromIndex ? "Índice local" : "WordPress directo"}
+          </span>
+          <span>{total} imagen{total !== 1 ? "es" : ""}</span>
+        </div>
+      ) : null}
 
       <input ref={fileInputRef} accept="image/*" className="hidden" onChange={(event) => void handleUpload(event.target.files?.[0] ?? null)} type="file" />
 
@@ -144,7 +159,30 @@ export function MediaLibraryBrowser({
       {loading ? <div className="text-sm text-muted-foreground">Cargando biblioteca de imágenes...</div> : null}
       {error ? <div className="rounded-xl border border-destructive/30 bg-destructive/10 px-3 py-3 text-sm text-destructive">{error}</div> : null}
 
-      {!loading && !error ? (
+      {/* Índice vacío — sin búsqueda activa */}
+      {!loading && !error && total === 0 && !searchTerm ? (
+        <div className="flex flex-col items-center justify-center rounded-3xl border border-dashed border-border bg-background/60 px-6 py-14 text-center">
+          <div className="rounded-2xl border border-border bg-card p-4">
+            <DatabaseZap className="h-8 w-8 text-muted-foreground" />
+          </div>
+          <div className="mt-5 text-base font-semibold text-foreground">El índice de imágenes está vacío</div>
+          <div className="mt-2 max-w-sm text-sm leading-6 text-muted-foreground">
+            Descarga el índice de la biblioteca de WordPress una vez. Después, la galería y las importaciones masivas funcionan sin consultar WordPress.
+          </div>
+          {onSyncRequest ? (
+            <Button className="mt-6 rounded-xl" onClick={onSyncRequest}>
+              <DatabaseZap className="mr-2 h-4 w-4" />
+              Sincronizar índice ahora
+            </Button>
+          ) : (
+            <div className="mt-6 rounded-xl border border-border bg-card px-4 py-3 text-sm text-muted-foreground">
+              Ve a <span className="font-medium text-foreground">Imágenes</span> y pulsa "Sincronizar índice".
+            </div>
+          )}
+        </div>
+      ) : null}
+
+      {!loading && !error && (total > 0 || searchTerm) ? (
         <div className="grid grid-cols-2 gap-4 xl:grid-cols-4">
           {items.map((item) => (
             <div key={item.id} className="overflow-hidden rounded-2xl border border-border bg-card/90">

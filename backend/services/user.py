@@ -143,6 +143,20 @@ def create_admin_client(db: Session, payload: AdminClientCreate) -> dict:
     return _serialize_admin_client(user, membership, tenant)
 
 
+def delete_admin_client(db: Session, user_id, actor) -> None:
+    account = user_repository.get_client_account(db, user_id)
+    if not account:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Cliente no encontrado")
+    user, _, tenant = account
+    if actor.id == user.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No puedes eliminarte a ti mismo")
+    # Delete tenant first — DB CASCADE removes backups, media, import drafts, memberships
+    user_repository.delete_tenant(db, tenant)
+    # Delete user (memberships already gone via cascade)
+    user_repository.delete_user(db, user)
+    db.commit()
+
+
 def update_admin_client(db: Session, user_id, payload: AdminClientUpdate) -> dict:
     account = user_repository.get_client_account(db, user_id)
     if not account:

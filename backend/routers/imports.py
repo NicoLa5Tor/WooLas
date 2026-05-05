@@ -75,9 +75,25 @@ async def download_import_template(context: TenantAccessContext = Depends(requir
     return Response(content=file_bytes, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
 
 
+def _parse_product_id_overrides(value: str | None) -> dict[int, int] | None:
+    if not value or not value.strip():
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="product_id_overrides debe ser un JSON válido") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="product_id_overrides debe ser un objeto")
+    try:
+        return {int(k): int(v) for k, v in parsed.items()}
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="product_id_overrides: claves y valores deben ser enteros") from exc
+
+
 @router.post("/preview")
 async def preview_import_draft(
     selected_fields: str = Form(...),
+    product_id_overrides: str | None = Form(default=None),
     context: TenantAccessContext = Depends(require_recent_backup(Role.CLIENT)),
 ):
     return success_response(
@@ -86,6 +102,7 @@ async def preview_import_draft(
             tenant_id=context.tenant.id,
             selected_fields=_parse_selected_fields(selected_fields),
             products=context.backup_record.payload,
+            product_id_overrides=_parse_product_id_overrides(product_id_overrides),
         )
     )
 
@@ -94,6 +111,7 @@ async def preview_import_draft(
 async def apply_import_draft(
     selected_fields: str = Form(...),
     selected_row_indexes: str | None = Form(default=None),
+    product_id_overrides: str | None = Form(default=None),
     context: TenantAccessContext = Depends(require_recent_backup(Role.CLIENT)),
 ):
     woo_service = WooCommerceService(**context.credentials)
@@ -107,6 +125,7 @@ async def apply_import_draft(
             backup_record=context.backup_record,
             woo_service=woo_service,
             credentials=context.credentials,
+            product_id_overrides=_parse_product_id_overrides(product_id_overrides),
             wp_url=context.tenant.wc_url,
             wp_user=None if context.wp_credentials is None else context.wp_credentials["wp_user"],
             wp_app_password=None if context.wp_credentials is None else context.wp_credentials["wp_app_password"],

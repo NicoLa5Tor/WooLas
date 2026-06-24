@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 
-export type ProcessType = "restore" | "media_sync" | "image_import" | "backup_create";
+export type ProcessType = "restore" | "media_sync" | "image_import" | "backup_create" | "media_purge";
 export type ProcessStatus = "pending" | "running" | "completed" | "failed";
 
 export type Process = {

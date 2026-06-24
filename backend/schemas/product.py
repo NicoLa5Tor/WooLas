@@ -129,6 +129,7 @@ class ProductBase(BaseModel):
     attributes: list[ProductAttributeInput] = Field(default_factory=list)
     upsell_ids: list[int] = Field(default_factory=list)
     cross_sell_ids: list[int] = Field(default_factory=list)
+    grouped_products: list[int] = Field(default_factory=list)
     downloads: list[ProductDownloadInput] = Field(default_factory=list)
     download_limit: int | None = None
     download_expiry: int | None = None
@@ -153,6 +154,7 @@ class ProductUpdate(ProductBase):
     attributes: list[ProductAttributeInput] | None = None
     upsell_ids: list[int] | None = None
     cross_sell_ids: list[int] | None = None
+    grouped_products: list[int] | None = None
     downloads: list[ProductDownloadInput] | None = None
     meta_data: list[ProductMetaDataInput] | None = None
 

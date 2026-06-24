@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import uuid
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 from uuid import UUID
 from difflib import SequenceMatcher
@@ -216,6 +217,13 @@ def _format_bool(value: object) -> str:
     return "true" if bool(value) else "false"
 
 
+def _clean_text(value: object) -> str:
+    """Decode HTML entities (&#8211; → –, &amp; → &, etc.) and strip."""
+    if value is None or value == "":
+        return ""
+    return html.unescape(str(value)).strip()
+
+
 def _join_ids(items: list[object]) -> str:
     return ";".join(str(item) for item in items if item not in {None, ""})
 
@@ -227,13 +235,15 @@ def _join_taxonomy_ids(items: list[dict]) -> str:
 def _join_attribute_options(attribute: dict | None) -> str:
     if not attribute:
         return ""
-    return ";".join(str(option) for option in attribute.get("options", []) if str(option).strip())
+    return ";".join(_clean_text(option) for option in attribute.get("options", []) if str(option).strip())
 
 
 def _image_name(image: dict) -> str:
+    raw = str(image.get("name") or "").strip()
+    if raw:
+        return html.unescape(raw)
     return (
-        str(image.get("name") or "").strip()
-        or PurePosixPath(str(image.get("src") or "")).name
+        PurePosixPath(str(image.get("src") or "")).name
         or f"imagen-{image.get('id', '')}"
     )
 
@@ -245,7 +255,7 @@ def _html_to_plain_text(value: object) -> str:
     text = re.sub(r"</p>\s*<p>", "\n\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = HTML_TAG_RE.sub("", text)
-    text = text.replace("&nbsp;", " ")
+    text = html.unescape(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
@@ -273,13 +283,13 @@ def _product_to_template_row(product: dict) -> list[str]:
 
     return [
         str(product.get("id") or ""),
-        str(product.get("sku") or ""),
-        str(product.get("name") or ""),
-        str(product.get("slug") or ""),
-        str(product.get("type") or ""),
-        str(product.get("status") or ""),
+        _clean_text(product.get("sku")),
+        _clean_text(product.get("name")),
+        _clean_text(product.get("slug")),
+        _clean_text(product.get("type")),
+        _clean_text(product.get("status")),
         _format_bool(product.get("featured")),
-        str(product.get("catalog_visibility") or ""),
+        _clean_text(product.get("catalog_visibility")),
         str(product.get("regular_price") or ""),
         str(product.get("sale_price") or ""),
         str(product.get("date_on_sale_from") or ""),
@@ -288,23 +298,23 @@ def _product_to_template_row(product: dict) -> list[str]:
         _html_to_plain_text(product.get("short_description")),
         _format_bool(product.get("manage_stock")),
         "" if product.get("stock_quantity") is None else str(product.get("stock_quantity")),
-        str(product.get("stock_status") or ""),
-        str(product.get("backorders") or ""),
+        _clean_text(product.get("stock_status")),
+        _clean_text(product.get("backorders")),
         _format_bool(product.get("sold_individually")),
         "" if product.get("low_stock_amount") is None else str(product.get("low_stock_amount")),
         str(product.get("weight") or ""),
         str(dimensions.get("length") or ""),
         str(dimensions.get("width") or ""),
         str(dimensions.get("height") or ""),
-        str(product.get("shipping_class") or ""),
+        _clean_text(product.get("shipping_class")),
         _format_bool(product.get("virtual")),
         _format_bool(product.get("downloadable")),
         str(images[0].get("id") or "") if images else "",
         _join_ids([image.get("id") for image in images[1:]]),
         ";".join(_image_name(image) for image in images if image),
-        str(attr1.get("name") or "") if attr1 else "",
+        _clean_text(attr1.get("name")) if attr1 else "",
         _join_attribute_options(attr1),
-        str(attr2.get("name") or "") if attr2 else "",
+        _clean_text(attr2.get("name")) if attr2 else "",
         _join_attribute_options(attr2),
         _join_taxonomy_ids(product.get("categories", [])),
         _join_taxonomy_ids(product.get("tags", [])),
@@ -315,7 +325,7 @@ def _product_to_template_row(product: dict) -> list[str]:
     ]
 
 
-def _build_template_workbook(rows: list[list[str]], title: str, *, highlight_first_row: bool) -> bytes:
+def _build_template_workbook(rows: list[list[str]], title: str, *, highlight_first_row: bool, categories: list[dict] | None = None, media_records=None) -> bytes:
     workbook = Workbook()
     ws = workbook.active
     ws.title = "productos"
@@ -451,6 +461,58 @@ def _build_template_workbook(rows: list[list[str]], title: str, *, highlight_fir
     _autosize_columns(wi, min_width=16, max_width=56)
     _autosize_columns(wr, min_width=18, max_width=32)
 
+    # --- Hoja categorias (datos en vivo desde WC) ---
+    cat_rows = [
+        [
+            str(cat.get("id") or ""),
+            str(cat.get("name") or ""),
+            str(cat.get("slug") or ""),
+            str(cat.get("parent") or "0"),
+            str(cat.get("description") or ""),
+            str(cat.get("count") or "0"),
+        ]
+        for cat in (categories or [])
+    ]
+    _add_catalog_sheet(
+        workbook,
+        sheet_name="categorias",
+        title="CATEGORIAS — usa el ID en la columna 'IDs categorias' del Excel de productos",
+        headers=[
+            ("ID", "0369A1"),
+            ("Nombre", "0369A1"),
+            ("Slug", "0369A1"),
+            ("ID categoria padre (0 = raiz)", "0369A1"),
+            ("Descripcion", "0369A1"),
+            ("Productos", "0369A1"),
+        ],
+        rows=cat_rows,
+    )
+
+    # --- Hoja imagenes (desde media index local) ---
+    img_rows = [
+        [
+            str(rec.media_id),
+            str(rec.filename or ""),
+            str(rec.title or ""),
+            str(rec.url or ""),
+            str(rec.thumbnail or ""),
+        ]
+        for rec in (media_records or [])
+    ]
+    _add_catalog_sheet(
+        workbook,
+        sheet_name="imagenes",
+        title="IMAGENES (media index) — usa el ID o el nombre en las columnas de imagenes",
+        headers=[
+            ("ID WordPress", ORANGE),
+            ("Nombre archivo", ORANGE),
+            ("Titulo", ORANGE),
+            ("URL completa", ORANGE),
+            ("Thumbnail", ORANGE),
+        ],
+        rows=img_rows,
+    )
+
     output = BytesIO()
     workbook.save(output)
     return output.getvalue()
@@ -529,7 +591,56 @@ def get_current_import_draft_bytes(db: Session, tenant_id: UUID) -> tuple[dict, 
     return _build_draft_response(record), path.read_bytes()
 
 
-def build_import_template() -> tuple[str, bytes]:
+
+def _add_catalog_sheet(
+    workbook,
+    sheet_name: str,
+    title: str,
+    headers: list[tuple[str, str]],  # (label, color)
+    rows: list[list[str]],
+) -> None:
+    """Generic helper to add a reference sheet with title row, header row, and data rows."""
+    ws = workbook.create_sheet(sheet_name)
+    ws.sheet_view.showGridLines = False
+
+    n_cols = len(headers)
+    last_col = get_column_letter(n_cols)
+    ws.merge_cells(f"A1:{last_col}1")
+    c = ws["A1"]
+    c.value = title
+    c.font = Font(bold=True, size=12, color=WHITE, name="Arial")
+    c.fill = PatternFill("solid", start_color=DARK)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 26
+
+    for col, (label, color) in enumerate(headers, 1):
+        c = ws.cell(row=2, column=col, value=label)
+        c.font = Font(bold=True, color=WHITE, size=9, name="Arial")
+        c.fill = PatternFill("solid", start_color=color)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = brd
+    ws.row_dimensions[2].height = 22
+
+    for i, row in enumerate(rows):
+        bg = WHITE if i % 2 == 0 else ALT
+        for col, val in enumerate(row, 1):
+            c = ws.cell(row=i + 3, column=col, value=val)
+            c.font = Font(size=9, name="Arial", color=DARK)
+            c.fill = PatternFill("solid", start_color=bg)
+            c.alignment = Alignment(horizontal="left", vertical="center")
+            c.border = brd
+        ws.row_dimensions[i + 3].height = 20
+
+    if not rows:
+        ws.cell(row=3, column=1, value="(Sin datos en el backup actual)")
+
+    _autosize_columns(ws, min_width=10, max_width=52)
+
+
+def build_import_template(
+    categories: list[dict] | None = None,
+    media_records=None,  # list[MediaIndexRecord]
+) -> tuple[str, bytes]:
     sample = [
         "12345", "03330154", "Producto ejemplo", "producto-ejemplo",
         "variable", "publish", "true", "visible",
@@ -542,12 +653,80 @@ def build_import_template() -> tuple[str, bytes]:
         "12;15", "3;9", "220;221", "330;331",
         "_origen_excel", "campana_mayo",
     ]
-    return "plantilla_productos_woocommerce.xlsx", _build_template_workbook([sample], "PLANTILLA DE IMPORTACION - WOOCOMMERCE", highlight_first_row=True)
+    workbook_bytes = _build_template_workbook(
+        [sample], "PLANTILLA DE IMPORTACION - WOOCOMMERCE", highlight_first_row=True,
+        categories=categories or [],
+        media_records=media_records or [],
+    )
+    return "plantilla_productos_woocommerce.xlsx", workbook_bytes
 
 
 def build_products_export(products: list[dict]) -> tuple[str, bytes]:
     rows = [_product_to_template_row(product) for product in products]
     return "productos_woocommerce.xlsx", _build_template_workbook(rows, "EXPORTACION DE PRODUCTOS - WOOCOMMERCE", highlight_first_row=False)
+
+
+def build_media_export(media_records) -> tuple[str, bytes]:
+    workbook = Workbook()
+    ws = workbook.active
+    ws.title = "imagenes"
+    ws.sheet_view.showGridLines = False
+
+    title_text = "BIBLIOTECA DE IMÁGENES - WOOCOMMERCE"
+    headers = [
+        ("ID WordPress", ORANGE),
+        ("Nombre archivo", ORANGE),
+        ("Titulo", ORANGE),
+        ("Slug", ORANGE),
+        ("URL completa", ORANGE),
+        ("Thumbnail", ORANGE),
+        ("Subida", ORANGE),
+    ]
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    title_cell = ws.cell(row=1, column=1, value=title_text)
+    title_cell.font = Font(name="Calibri", size=14, bold=True, color=WHITE)
+    title_cell.fill = PatternFill("solid", fgColor=DARK)
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    for col_idx, (label, color) in enumerate(headers, start=1):
+        cell = ws.cell(row=2, column=col_idx, value=label)
+        cell.font = Font(name="Calibri", size=11, bold=True, color=WHITE)
+        cell.fill = PatternFill("solid", fgColor=color)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = brd
+    ws.row_dimensions[2].height = 24
+
+    for row_offset, rec in enumerate(media_records or [], start=3):
+        values = [
+            str(rec.media_id),
+            _clean_text(rec.filename),
+            _clean_text(rec.title),
+            _clean_text(rec.slug),
+            str(rec.url or ""),
+            str(rec.thumbnail or ""),
+            rec.uploaded_at.isoformat() if rec.uploaded_at else "",
+        ]
+        for col_idx, value in enumerate(values, start=1):
+            cell = ws.cell(row=row_offset, column=col_idx, value=value)
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+            cell.border = brd
+            if row_offset % 2 == 0:
+                cell.fill = PatternFill("solid", fgColor=ALT)
+
+    if not media_records:
+        ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=len(headers))
+        empty_cell = ws.cell(row=3, column=1, value="(Sin imágenes en el índice — sincroniza la biblioteca primero)")
+        empty_cell.font = Font(italic=True, color="64748B")
+        empty_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.freeze_panes = "A3"
+    _autosize_columns(ws, min_width=12, max_width=60)
+
+    output = BytesIO()
+    workbook.save(output)
+    return "imagenes_woocommerce.xlsx", output.getvalue()
 
 
 def _canonical_row_to_template_row(row: dict[str, str]) -> list[str]:
@@ -651,56 +830,25 @@ async def _run_import_images_job(
 
         # 1. Construir lista de productos a procesar
         selected_indexes = set(range(len(rows))) if selected_row_indexes is None else set(selected_row_indexes)
-        products_by_id = {int(p["id"]): p for p in products if str(p.get("id", "")).isdigit()}
-        # SKUs can be duplicated → map each SKU to a list of products
-        products_by_sku: dict[str, list[dict]] = {}
-        for p in products:
-            s = str(p.get("sku", "")).strip()
-            if s:
-                products_by_sku.setdefault(s, []).append(p)
-
-        def _resolve_by_sku(sku: str, name_hint: str) -> dict | None:
-            candidates = products_by_sku.get(sku)
-            if not candidates:
-                return None
-            if len(candidates) == 1:
-                return candidates[0]
-            # Multiple products share this SKU — pick best name match
-            if name_hint:
-                hint_lower = name_hint.lower()
-                for c in candidates:
-                    if str(c.get("name", "")).lower() == hint_lower:
-                        return c
-                # Partial match fallback
-                for c in candidates:
-                    if hint_lower in str(c.get("name", "")).lower():
-                        return c
-            return candidates[0]
+        matcher = excel_service._product_matcher(products)
 
         matched: list[tuple[ImportImagesJobRowStatus, dict[str, str], dict]] = []
         for row_index, row in enumerate(rows):
             if row_index not in selected_indexes:
                 continue
-            sku = row.get("sku", "").strip()
-            product_id_raw = row.get("product_id", "").strip()
-            name_hint = row.get("name", "").strip()
-            identifier = sku or product_id_raw or "sin identificador"
-            if sku:
-                product = _resolve_by_sku(sku, name_hint)
-                sku_candidates = products_by_sku.get(sku, [])
-                if product is None:
-                    result.failed += 1
+            product, identifier, sku_candidates = matcher(row)
+            if product is None:
+                result.failed += 1
+                if sku_candidates:
+                    result.errors.append(
+                        {
+                            "identifier": identifier,
+                            "error": f"SKU ambiguo: {len(sku_candidates)} productos comparten este SKU. Selecciona uno manualmente.",
+                        }
+                    )
+                else:
                     result.errors.append({"identifier": identifier, "error": "Producto no encontrado en el backup"})
-                    continue
-                if len(sku_candidates) > 1 and name_hint:
-                    # Record which product was selected when SKU was ambiguous
-                    identifier = f"{sku} ({product.get('name', '')})"
-            else:
-                product = products_by_id.get(int(product_id_raw)) if product_id_raw.isdigit() else None
-                if product is None:
-                    result.failed += 1
-                    result.errors.append({"identifier": identifier, "error": "Producto no encontrado en el backup"})
-                    continue
+                continue
             row_status = ImportImagesJobRowStatus(
                 row_index=row_index,
                 identifier=identifier,
@@ -727,26 +875,47 @@ async def _run_import_images_job(
                 gallery_raw = str(row.get("image_galeria_ids", "")).strip()
                 names_raw = str(row.get("image_nombres", "")).strip()
 
-                if principal_raw or gallery_raw:
-                    image_ids = list(dict.fromkeys(
-                        i for i in _row_split_int_values(principal_raw) + _row_split_int_values(gallery_raw)
-                        if i > 0
-                    ))
-                elif names_raw:
+                principal_ids = [i for i in _row_split_int_values(principal_raw) if i > 0]
+                gallery_ids = [i for i in _row_split_int_values(gallery_raw) if i > 0]
+                requested_names = _row_split_values(names_raw) if names_raw else []
+
+                row_status.requested_principal_id = principal_ids[0] if principal_ids else None
+                row_status.requested_gallery_ids = gallery_ids
+                row_status.requested_names = requested_names
+
+                resolved_names_pairs: list[tuple[int, str]] = []
+                unresolved: list[str] = []
+
+                if principal_ids or gallery_ids:
+                    image_ids = list(dict.fromkeys(principal_ids + gallery_ids))
+                elif requested_names:
                     resolved = media_service.resolve_media_by_names_from_index(
-                        db=job_db, tenant_id=tenant_id, names=_row_split_values(names_raw)
+                        db=job_db, tenant_id=tenant_id, names=requested_names
                     )
-                    image_ids = [int(r["item"]["id"]) for r in resolved if r.get("matched") and r.get("item") and int(r["item"]["id"]) > 0]
+                    image_ids = []
+                    for r in resolved:
+                        item = r.get("item") if r.get("matched") else None
+                        if item and int(item.get("id") or 0) > 0:
+                            iid = int(item["id"])
+                            iname = str(item.get("filename") or item.get("title") or item.get("name") or "")
+                            if iid not in image_ids:
+                                image_ids.append(iid)
+                                resolved_names_pairs.append((iid, iname))
+                        else:
+                            unresolved.append(str(r.get("requested") or ""))
                 else:
                     image_ids = []
+
+                row_status.resolved_image_ids = image_ids
+                row_status.resolved_image_names = [name for _, name in resolved_names_pairs]
+                row_status.unresolved_names = unresolved
 
                 if not image_ids:
                     row_status.status = "skipped"
                     if not principal_raw and not gallery_raw and not names_raw:
                         row_status.error = "Sin datos de imagen en esta fila"
                     elif names_raw:
-                        tried = _row_split_values(names_raw)
-                        row_status.error = f"No se encontró en el índice: {', '.join(tried[:2])}{'...' if len(tried) > 2 else ''}"
+                        row_status.error = f"No se encontró en el índice: {', '.join(unresolved[:3])}{'...' if len(unresolved) > 3 else ''}"
                     else:
                         row_status.error = "Los IDs de imagen no son válidos (¿todos cero?)"
                     result.skipped += 1
@@ -755,9 +924,27 @@ async def _run_import_images_job(
                 payload = {"id": product["id"], "images": [{"id": img_id} for img_id in image_ids]}
                 updated_product = await woo_service.update_product(int(product["id"]), payload)
 
-                row_status.status = "completed"
-                result.updated += 1
-                updated_products.append(updated_product)
+                # Verificar que WC realmente asignó los IDs pedidos.
+                applied_ids = [
+                    int(img.get("id"))
+                    for img in (updated_product.get("images") or [])
+                    if str(img.get("id") or "").isdigit()
+                ]
+                row_status.applied_image_ids = applied_ids
+                missing = [i for i in image_ids if i not in applied_ids]
+
+                if missing:
+                    row_status.status = "failed"
+                    row_status.error = f"WooCommerce no aplicó estas imágenes: {', '.join(str(m) for m in missing)}"
+                    result.failed += 1
+                    result.errors.append({"identifier": identifier, "error": row_status.error})
+                else:
+                    row_status.status = "completed"
+                    if unresolved:
+                        # Aplicó lo que pudo pero algunos nombres no resolvieron — avisar.
+                        row_status.error = f"No se encontraron: {', '.join(unresolved[:3])}{'...' if len(unresolved) > 3 else ''}"
+                    result.updated += 1
+                    updated_products.append(updated_product)
 
             except Exception as exc:
                 row_status.status = "failed"

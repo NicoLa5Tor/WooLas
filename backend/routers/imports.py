@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from core.dependencies import TenantAccessContext, get_db, require_recent_backup, require_role
 from core.responses import success_response
 from models.user import Role
+from repositories import media_index as media_index_repository
 from schemas.imports import ImportRefactorPayload
 from services import imports as import_service
 from services.woocommerce import WooCommerceService
@@ -70,7 +71,13 @@ async def download_current_import_draft(context: TenantAccessContext = Depends(r
 
 @router.get("/template")
 async def download_import_template(context: TenantAccessContext = Depends(require_role(Role.CLIENT))):
-    filename, file_bytes = import_service.build_import_template()
+    woo_service = WooCommerceService(**context.credentials)
+    try:
+        categories = await woo_service.fetch_all_categories()
+    except Exception:
+        categories = []
+    media_records = media_index_repository.list_media_index_records(context.db, context.tenant.id)
+    filename, file_bytes = import_service.build_import_template(categories=categories, media_records=media_records)
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return Response(content=file_bytes, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
 

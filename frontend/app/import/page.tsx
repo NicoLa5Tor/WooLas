@@ -38,12 +38,23 @@ type UpdateResponse = {
   images_job?: { job_id: string } | null;
 };
 
+type ImageRowDetail = {
+  requested_principal_id: number | null;
+  requested_gallery_ids: number[];
+  requested_names: string[];
+  resolved_image_ids: number[];
+  resolved_image_names: string[];
+  unresolved_names: string[];
+  applied_image_ids: number[];
+};
+
 type ApplyResultRow = {
   row_index: number;
   identifier: string;
   product_name: string | null;
   status: "ok" | "failed" | "skipped";
   error: string | null;
+  image_detail?: ImageRowDetail;
 };
 
 type ImportImagesJobStatus = {
@@ -63,6 +74,13 @@ type ImportImagesJobStatus = {
     product_name: string | null;
     status: "pending" | "running" | "completed" | "failed" | "skipped";
     error: string | null;
+    requested_principal_id: number | null;
+    requested_gallery_ids: number[];
+    requested_names: string[];
+    resolved_image_ids: number[];
+    resolved_image_names: string[];
+    unresolved_names: string[];
+    applied_image_ids: number[];
   }>;
   result: {
     updated: number;
@@ -469,6 +487,15 @@ export default function ImportPage() {
           product_name,
           status: imgRow.status === "completed" ? "ok" : imgRow.status === "skipped" ? "skipped" : "failed",
           error: imgRow.error,
+          image_detail: {
+            requested_principal_id: imgRow.requested_principal_id ?? null,
+            requested_gallery_ids: imgRow.requested_gallery_ids ?? [],
+            requested_names: imgRow.requested_names ?? [],
+            resolved_image_ids: imgRow.resolved_image_ids ?? [],
+            resolved_image_names: imgRow.resolved_image_names ?? [],
+            unresolved_names: imgRow.unresolved_names ?? [],
+            applied_image_ids: imgRow.applied_image_ids ?? [],
+          },
         };
       }
 
@@ -550,7 +577,7 @@ export default function ImportPage() {
         addProcess({
           type: "image_import",
           label: "Importar imágenes masivo",
-          pollUrl: `/tenants/${activeTenant.id}/apply-jobs/${imgJobId}`,
+          pollUrl: `${tenantPath}/apply-jobs/${imgJobId}`,
         });
         setResult({
           updated: response.data.updated,
@@ -1170,7 +1197,33 @@ export default function ImportPage() {
                         </td>
                         <td className="px-3 py-3 font-mono text-xs">{row.identifier}</td>
                         <td className="px-3 py-3 text-muted-foreground">{row.product_name ?? "—"}</td>
-                        <td className="px-3 py-3 text-xs text-muted-foreground">{row.error ?? (row.status === "ok" ? "Actualizado correctamente" : "Sin datos")}</td>
+                        <td className="px-3 py-3 text-xs text-muted-foreground">
+                          {row.image_detail ? (
+                            <div className="space-y-1">
+                              {row.image_detail.requested_principal_id !== null ? (
+                                <div><span className="font-semibold">Principal pedido:</span> #{row.image_detail.requested_principal_id}</div>
+                              ) : null}
+                              {row.image_detail.requested_gallery_ids.length > 0 ? (
+                                <div><span className="font-semibold">Galería pedida:</span> {row.image_detail.requested_gallery_ids.join(", ")}</div>
+                              ) : null}
+                              {row.image_detail.requested_names.length > 0 ? (
+                                <div><span className="font-semibold">Nombres pedidos:</span> {row.image_detail.requested_names.join(", ")}</div>
+                              ) : null}
+                              {row.image_detail.resolved_image_names.length > 0 ? (
+                                <div><span className="font-semibold">Resueltos:</span> {row.image_detail.resolved_image_names.join(", ")}</div>
+                              ) : null}
+                              {row.image_detail.applied_image_ids.length > 0 ? (
+                                <div className="text-emerald-700 dark:text-emerald-400"><span className="font-semibold">WC aplicó IDs:</span> {row.image_detail.applied_image_ids.join(", ")}</div>
+                              ) : null}
+                              {row.image_detail.unresolved_names.length > 0 ? (
+                                <div className="text-amber-700 dark:text-amber-400"><span className="font-semibold">No encontrados:</span> {row.image_detail.unresolved_names.join(", ")}</div>
+                              ) : null}
+                              {row.error ? <div className="text-destructive">{row.error}</div> : null}
+                            </div>
+                          ) : (
+                            row.error ?? (row.status === "ok" ? "Actualizado correctamente" : "Sin datos")
+                          )}
+                        </td>
                         <td className="px-3 py-3">
                           {row.status === "failed" ? (
                             <Button
@@ -1397,6 +1450,30 @@ export default function ImportPage() {
                           <div className="h-full w-0" />
                         )}
                       </div>
+
+                      {/* Image detail */}
+                      {(row.requested_names?.length || row.requested_gallery_ids?.length || row.requested_principal_id || row.applied_image_ids?.length) ? (
+                        <div className="mt-1.5 space-y-0.5 text-[11px] text-muted-foreground">
+                          {row.requested_principal_id ? (
+                            <div>Principal pedido: #{row.requested_principal_id}</div>
+                          ) : null}
+                          {row.requested_gallery_ids?.length ? (
+                            <div>Galería pedida: {row.requested_gallery_ids.join(", ")}</div>
+                          ) : null}
+                          {row.requested_names?.length ? (
+                            <div>Nombres: {row.requested_names.join(", ")}</div>
+                          ) : null}
+                          {row.resolved_image_names?.length ? (
+                            <div>Resueltos: {row.resolved_image_names.join(", ")}</div>
+                          ) : null}
+                          {row.applied_image_ids?.length ? (
+                            <div className="text-emerald-700 dark:text-emerald-400">WC aplicó: {row.applied_image_ids.join(", ")}</div>
+                          ) : null}
+                          {row.unresolved_names?.length ? (
+                            <div className="text-amber-700 dark:text-amber-400">No encontrados: {row.unresolved_names.join(", ")}</div>
+                          ) : null}
+                        </div>
+                      ) : null}
 
                       {/* Error / skip reason */}
                       {(row.status === "failed" || row.status === "skipped") && row.error ? (

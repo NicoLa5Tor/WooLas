@@ -179,6 +179,20 @@ async def update_product(
     )
 
 
+@router.delete("/{product_id}")
+async def delete_product(
+    product_id: int,
+    force: bool = False,
+    context: TenantAccessContext = Depends(require_recent_backup(Role.CLIENT)),
+):
+    woo_service = WooCommerceService(**context.credentials)
+    result = await woo_service.delete_product(product_id, force=force)
+    from services import backup as backup_service
+    backup_service.remove_product_from_backup(context.db, context.backup_record, product_id)
+    context.db.commit()
+    return success_response(result)
+
+
 @router.post("/preview")
 async def preview_product_changes(
     file: UploadFile = File(...),

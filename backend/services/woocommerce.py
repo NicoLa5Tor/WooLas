@@ -113,6 +113,21 @@ class WooCommerceService:
 
         return found
 
+    async def fetch_all_categories(self) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            response = await self._request("GET", "products/categories", params={"per_page": 100, "page": page})
+            page_items = response.json()
+            if not page_items:
+                break
+            items.extend(page_items)
+            total_pages = int(response.headers.get("X-WP-TotalPages", page))
+            if page >= total_pages:
+                break
+            page += 1
+        return items
+
     async def list_categories(self):
         return (await self._request("GET", "products/categories", params={"per_page": 100})).json()
 

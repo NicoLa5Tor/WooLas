@@ -44,6 +44,14 @@ class ImportImagesJobRowStatus(BaseModel):
     product_name: str | None = None
     status: Literal["pending", "running", "completed", "failed", "skipped"] = "pending"
     error: str | None = None
+    # Detalle por fila: qué se pidió, qué resolvió, qué aplicó WC.
+    requested_principal_id: int | None = None
+    requested_gallery_ids: list[int] = Field(default_factory=list)
+    requested_names: list[str] = Field(default_factory=list)
+    resolved_image_ids: list[int] = Field(default_factory=list)
+    resolved_image_names: list[str] = Field(default_factory=list)
+    unresolved_names: list[str] = Field(default_factory=list)
+    applied_image_ids: list[int] = Field(default_factory=list)
 
 
 class ImportImagesJobStatus(BaseModel):

@@ -1,4 +1,5 @@
 import asyncio
+import html
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Any
@@ -12,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from repositories import media_cache as media_cache_repository
 from repositories import media_index as media_index_repository
-from schemas.media import MediaItem, MediaSyncJobStatus
+from schemas.media import MediaItem, MediaPurgeJobStatus, MediaSyncJobStatus
 
 
 def _base_wp_url(wc_url: str) -> str:
@@ -451,7 +452,8 @@ def _find_media_in_items(name: str, *, items: list[dict[str, Any]], by_lookup: d
 
 
 def _normalize_media_lookup(value: str) -> tuple[str, str]:
-    cleaned = unquote(str(value).strip().lower())
+    cleaned = html.unescape(str(value)).strip().lower()
+    cleaned = unquote(cleaned)
     if not cleaned:
         return "", ""
     cleaned = unicodedata.normalize("NFKD", cleaned)
@@ -518,3 +520,90 @@ async def resolve_media_by_names(
         )
 
     return resolved
+
+
+media_purge_jobs: dict[str, MediaPurgeJobStatus] = {}
+
+
+async def _run_media_purge_job(
+    *,
+    job_id: str,
+    tenant_id,
+    wp_url: str,
+    wp_user: str,
+    wp_app_password: str,
+) -> None:
+    from core.database import SessionLocal
+
+    job = media_purge_jobs[job_id]
+    db = None
+    try:
+        job.status = "running"
+        db = SessionLocal()
+
+        # Fetch every media item from WP fresh (cache_ttl_minutes=0)
+        items = await fetch_all_media_library_items(
+            wp_url=wp_url,
+            wp_user=wp_user,
+            wp_app_password=wp_app_password,
+            db=db,
+            tenant_id=tenant_id,
+            cache_ttl_minutes=0,
+        )
+        job.total = len(items)
+
+        base = f"{_base_wp_url(wp_url)}/wp-json/wp/v2/media"
+        async with httpx.AsyncClient(timeout=60.0, auth=httpx.BasicAuth(wp_user, wp_app_password)) as client:
+            for item in items:
+                media_id = item.get("id")
+                if not media_id:
+                    job.processed += 1
+                    continue
+                job.current_filename = str(item.get("filename") or f"media-{media_id}")
+                try:
+                    response = await client.delete(f"{base}/{media_id}", params={"force": "true"})
+                    response.raise_for_status()
+                    job.deleted += 1
+                    media_index_repository.delete_media_index_record_by_media_id(db, tenant_id, int(media_id))
+                except Exception as exc:
+                    job.failed += 1
+                    job.errors.append({"media_id": str(media_id), "error": str(exc)[:200]})
+                finally:
+                    job.processed += 1
+                    job.progress = min(99, int(job.processed * 100 / max(job.total, 1)))
+
+        # Clean cache + remaining records
+        media_cache_repository.delete_media_cache_for_tenant(db, tenant_id)
+        if job.failed == 0:
+            media_index_repository.delete_all_media_index_records(db, tenant_id)
+        db.commit()
+        job.current_filename = None
+        job.progress = 100
+        job.status = "completed"
+    except Exception as exc:
+        job.status = "failed"
+        job.error = str(exc)
+    finally:
+        if db is not None:
+            db.close()
+
+
+def start_media_purge(*, tenant_id, wp_url: str, wp_user: str, wp_app_password: str) -> MediaPurgeJobStatus:
+    import uuid
+    job_id = str(uuid.uuid4())
+    job = MediaPurgeJobStatus(job_id=job_id, status="pending")
+    media_purge_jobs[job_id] = job
+    asyncio.create_task(
+        _run_media_purge_job(
+            job_id=job_id,
+            tenant_id=tenant_id,
+            wp_url=wp_url,
+            wp_user=wp_user,
+            wp_app_password=wp_app_password,
+        )
+    )
+    return job
+
+
+def get_media_purge_job(job_id: str) -> MediaPurgeJobStatus | None:
+    return media_purge_jobs.get(job_id)

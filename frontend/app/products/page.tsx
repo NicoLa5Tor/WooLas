@@ -317,18 +317,6 @@ async function resolvePrefillImages(tenantId: string, row: Record<string, string
   };
 }
 
-async function resolveSelectedProductImages(tenantId: string, product: EditorProduct): Promise<PrefillImageResolution> {
-  const names = product.images.map((image) => image.name).filter((name): name is string => Boolean(name?.trim()));
-  if (names.length === 0) {
-    return { images: product.images, unresolved: [] };
-  }
-  return resolvePrefillImages(tenantId, {
-    image_nombres: names.join(", "),
-    image_principal_id: product.images[0]?.id ? String(product.images[0].id) : "",
-    image_galeria_ids: product.images.slice(1).map((image) => image.id).join(";")
-  });
-}
-
 function emptyProduct(): EditorProduct {
   return {
     name: "",
@@ -814,20 +802,9 @@ export default function ProductsPage() {
       setSaveOperationProgress((current) => (current >= 90 ? current : current + 6));
     }, 350);
     try {
-      let productToSave = selectedProduct;
+      const productToSave = selectedProduct;
       if (selectedProduct.images.length > 0) {
-        setSaveOperationStatus(`Validando imágenes de ${selectedProduct.name.trim()} en la media library...`);
-        const imageResolution = await resolveSelectedProductImages(activeTenant.id, selectedProduct);
-        if (imageResolution.images.length > 0) {
-          productToSave = { ...selectedProduct, images: imageResolution.images };
-          setSelectedProduct(productToSave);
-        }
-        if (imageResolution.unresolved.length > 0) {
-          setSaveOperationError(`No se encontraron estas imágenes: ${imageResolution.unresolved.join(", ")}`);
-          setSaveOperationStatus(`Imágenes no resueltas para ${selectedProduct.name.trim()}`);
-        } else {
-          setSaveOperationStatus(`Imágenes validadas para ${selectedProduct.name.trim()}`);
-        }
+        setSaveOperationStatus(`Guardando imágenes de ${selectedProduct.name.trim()} por Media ID...`);
       }
       const response = editorMode === "create"
         ? await apiRequest<Product>(withTenantPath(activeTenant.id, "/products"), { method: "POST", body: JSON.stringify(buildPayload(productToSave)) })
@@ -864,6 +841,23 @@ export default function ProductsPage() {
   const copyValue = async (value: string, label: string) => {
     await navigator.clipboard.writeText(value);
     showToast(`${label} copiado`);
+  };
+
+  const deleteProduct = async () => {
+    if (!selectedProduct || !selectedProduct.id || !activeTenant) return;
+    const name = selectedProduct.name || `Producto ${selectedProduct.id}`;
+    if (!window.confirm(`¿Eliminar "${name}" de WooCommerce? Esta acción no se puede deshacer.`)) return;
+    setSaving(true);
+    try {
+      await apiRequest(withTenantPath(activeTenant.id, `/products/${selectedProduct.id}?force=true`), { method: "DELETE" });
+      showToast(`${name} eliminado`);
+      setSelectedProduct(null);
+      await loadProducts(session ?? undefined);
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "No se pudo eliminar", "error");
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleMediaSelect = (item: MediaItem) => {
@@ -1468,6 +1462,11 @@ export default function ProductsPage() {
                   {selectedProduct.id ? <Button className="gap-2 rounded-xl" onClick={() => void copyValue(String(selectedProduct.id), "ID")} variant="outline"><Copy className="h-4 w-4" />Copiar ID</Button> : null}
                   {selectedProduct.sku ? <Button className="gap-2 rounded-xl" onClick={() => void copyValue(selectedProduct.sku, "SKU")} variant="outline"><Copy className="h-4 w-4" />Copiar SKU</Button> : null}
                   {selectedProduct.permalink ? <Button className="gap-2 rounded-xl" onClick={() => void copyValue(selectedProduct.permalink, "Enlace")} variant="outline"><Copy className="h-4 w-4" />Copiar enlace</Button> : null}
+                  {selectedProduct.id && editorMode !== "create" ? (
+                    <Button className="gap-2 rounded-xl text-destructive hover:bg-destructive/10" disabled={saving || !activeTenant} onClick={() => void deleteProduct()} variant="outline">
+                      <Trash2 className="h-4 w-4" />Eliminar producto
+                    </Button>
+                  ) : null}
                   <Button className="rounded-xl px-6 font-semibold" disabled={saving || !activeTenant} onClick={() => void saveProduct()}>{saving ? (editorMode === "create" ? "Creando..." : "Guardando...") : editorMode === "create" ? "Crear producto" : "Guardar cambios"}</Button>
                 </div>
               </div>

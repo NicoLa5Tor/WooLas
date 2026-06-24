@@ -433,3 +433,13 @@ def merge_products_into_backup(db: Session, backup_record, updated_products: lis
     backup_record.product_count = len(backup_record.payload)
     backup_record.created_at = datetime.utcnow()
     backup_repository.update_backup_record(db, backup_record)
+
+
+def remove_product_from_backup(db: Session, backup_record, product_id: int) -> None:
+    new_payload = [p for p in backup_record.payload if int(p.get("id") or 0) != int(product_id)]
+    if len(new_payload) == len(backup_record.payload):
+        return
+    backup_record.payload = new_payload
+    backup_record.product_count = len(new_payload)
+    backup_record.created_at = datetime.utcnow()
+    backup_repository.update_backup_record(db, backup_record)

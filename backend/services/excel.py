@@ -102,6 +102,20 @@ FIELD_GROUPS = {
     "images": ["image_principal_id", "image_galeria_ids", "image_nombres"],
 }
 
+# Fields where empty cell means "clear field" instead of "skip".
+# Boolean/numeric/enum fields stay out (blank there is ambiguous).
+BLANKABLE_FIELDS = {
+    "name", "slug", "sku",
+    "regular_price", "sale_price", "date_on_sale_from", "date_on_sale_to",
+    "description", "short_description",
+    "weight", "length", "width", "height", "shipping_class",
+    "catalog_visibility",
+    "meta_key", "meta_value",
+    "category_ids", "tag_ids", "upsell_ids", "cross_sell_ids",
+    "image_principal_id", "image_galeria_ids", "image_nombres", "images",
+    "attr1_nombre", "attr1_valores", "attr2_nombre", "attr2_valores",
+}
+
 
 def _normalize_header(header: object) -> str:
     value = "" if header is None else str(header).strip()
@@ -285,9 +299,15 @@ def _current_field_value(product: dict[str, Any], field: str) -> str:
 
 
 def _row_has_field(row: dict[str, str], field: str) -> bool:
+    if field in BLANKABLE_FIELDS:
+        return True
     if field == "images":
         return any(str(row.get(header, "")).strip() for header in FIELD_GROUPS["images"])
     return str(row.get(field, "")).strip() != ""
+
+
+def _split_sku_values(value: str) -> list[str]:
+    return [item.strip() for item in re.split(r"[;,\n]+", str(value)) if item.strip()]
 
 
 def _product_matcher(products: list[dict[str, Any]]):
@@ -301,9 +321,30 @@ def _product_matcher(products: list[dict[str, Any]]):
     # Returns (product | None, identifier_str, sku_candidates_if_ambiguous)
     def matcher(row: dict[str, str]) -> tuple[dict | None, str, list[dict]]:
         sku = row.get("sku", "").strip()
+        sku_tokens = _split_sku_values(sku)
         product_id = row.get("product_id", "").strip()
-        if sku:
-            candidates = products_by_sku.get(sku, [])
+        if sku_tokens:
+            candidate_groups = [products_by_sku.get(token, []) for token in sku_tokens]
+            if any(not candidates for candidates in candidate_groups):
+                return None, sku, []
+
+            matching_ids = {
+                int(candidate["id"])
+                for candidate in candidate_groups[0]
+                if str(candidate.get("id", "")).isdigit()
+            }
+            for candidates in candidate_groups[1:]:
+                matching_ids &= {
+                    int(candidate["id"])
+                    for candidate in candidates
+                    if str(candidate.get("id", "")).isdigit()
+                }
+
+            candidates = [
+                candidate
+                for candidate in candidate_groups[0]
+                if str(candidate.get("id", "")).isdigit() and int(candidate["id"]) in matching_ids
+            ]
             if len(candidates) == 1:
                 return candidates[0], sku, []
             if len(candidates) > 1:
@@ -347,7 +388,7 @@ async def _build_row_payload(
         if field not in row:
             continue
         raw_value = row.get(field, "")
-        if raw_value == "":
+        if raw_value == "" and field not in BLANKABLE_FIELDS:
             continue
         payload[field] = normalize_field_value(field, raw_value)
 
@@ -355,7 +396,7 @@ async def _build_row_payload(
         dimensions = {
             key: str(row.get(key, "")).strip()
             for key in ("length", "width", "height")
-            if key in selected and str(row.get(key, "")).strip() != ""
+            if key in selected
         }
         if dimensions:
             payload["dimensions"] = dimensions
@@ -388,18 +429,24 @@ async def _build_row_payload(
                 if image_id not in deduped_image_ids:
                     deduped_image_ids.append(image_id)
             payload["images"] = [{"id": image_id} for image_id in deduped_image_ids]
+        elif not principal and not gallery and not image_names:
+            # All image cells blank → clear product images
+            payload["images"] = []
 
-    if selected & {"category_ids", "tag_ids"}:
-        if "category_ids" in selected and str(row.get("category_ids", "")).strip():
-            payload["categories"] = [{"id": item_id} for item_id in _split_int_values(row["category_ids"])]
-        if "tag_ids" in selected and str(row.get("tag_ids", "")).strip():
-            payload["tags"] = [{"id": item_id} for item_id in _split_int_values(row["tag_ids"])]
+    if "category_ids" in selected:
+        raw = str(row.get("category_ids", "")).strip()
+        payload["categories"] = [{"id": item_id} for item_id in _split_int_values(raw)] if raw else []
+    if "tag_ids" in selected:
+        raw = str(row.get("tag_ids", "")).strip()
+        payload["tags"] = [{"id": item_id} for item_id in _split_int_values(raw)] if raw else []
 
-    if "upsell_ids" in selected and str(row.get("upsell_ids", "")).strip():
-        payload["upsell_ids"] = _split_int_values(row["upsell_ids"])
+    if "upsell_ids" in selected:
+        raw = str(row.get("upsell_ids", "")).strip()
+        payload["upsell_ids"] = _split_int_values(raw) if raw else []
 
-    if "cross_sell_ids" in selected and str(row.get("cross_sell_ids", "")).strip():
-        payload["cross_sell_ids"] = _split_int_values(row["cross_sell_ids"])
+    if "cross_sell_ids" in selected:
+        raw = str(row.get("cross_sell_ids", "")).strip()
+        payload["cross_sell_ids"] = _split_int_values(raw) if raw else []
 
     if selected & {"attr1_nombre", "attr1_valores", "attr2_nombre", "attr2_valores"}:
         attributes: list[dict[str, Any]] = []

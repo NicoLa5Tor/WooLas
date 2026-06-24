@@ -40,3 +40,16 @@ class MediaSyncJobStatus(BaseModel):
     from_cache: bool = False
     progress: int = 0
     error: str | None = None
+
+
+class MediaPurgeJobStatus(BaseModel):
+    job_id: str
+    status: Literal["pending", "running", "completed", "failed"]
+    total: int = 0
+    processed: int = 0
+    deleted: int = 0
+    failed: int = 0
+    progress: int = 0
+    current_filename: str | None = None
+    errors: list[dict] = Field(default_factory=list)
+    error: str | None = None

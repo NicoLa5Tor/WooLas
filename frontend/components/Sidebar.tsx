@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { DatabaseBackup, FileImage, FileSpreadsheet, LogOut, MoonStar, PackageSearch, ShieldCheck, SunMedium, X } from "lucide-react";
+import { Boxes, DatabaseBackup, FileImage, FileSpreadsheet, LogOut, MoonStar, PackageSearch, ShieldCheck, SunMedium, X } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useEffect, useState } from "react";
 
@@ -20,6 +20,7 @@ const items: Array<{
   { href: "/backup", label: "Backup", icon: DatabaseBackup, roles: ["admin", "client"] },
   { href: "/import", label: "Importar Excel", icon: FileSpreadsheet, roles: ["admin", "client"] },
   { href: "/products", label: "Productos", icon: PackageSearch, roles: ["admin", "client"] },
+  { href: "/combos", label: "Combos", icon: Boxes, roles: ["admin", "client"] },
   { href: "/imagenes", label: "Imágenes", icon: FileImage, roles: ["admin", "client"] },
   { href: "/admin/users", label: "Clientes", icon: ShieldCheck, roles: ["admin"] }
 ];

@@ -96,3 +96,18 @@ def delete_missing_media_index_records(db: Session, tenant_id: UUID, keep_media_
         stmt = stmt.where(MediaIndexRecord.media_id.not_in(tuple(keep_media_ids)))
     db.execute(stmt)
     db.flush()
+
+
+def delete_media_index_record_by_media_id(db: Session, tenant_id: UUID, media_id: int) -> None:
+    db.execute(
+        delete(MediaIndexRecord).where(
+            MediaIndexRecord.tenant_id == tenant_id,
+            MediaIndexRecord.media_id == media_id,
+        )
+    )
+    db.flush()
+
+
+def delete_all_media_index_records(db: Session, tenant_id: UUID) -> None:
+    db.execute(delete(MediaIndexRecord).where(MediaIndexRecord.tenant_id == tenant_id))
+    db.flush()

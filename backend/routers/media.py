@@ -1,9 +1,11 @@
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 
 from core.dependencies import TenantAccessContext, require_role
 from core.responses import success_response
 from models.user import Role
+from repositories import media_index as media_index_repository
 from schemas.media import MediaResolvePayload
+from services import imports as import_service
 from services import media as media_service
 
 
@@ -33,6 +35,14 @@ async def get_media_library(
         search=search,
     )
     return success_response(data)
+
+
+@router.get("/export")
+async def export_media_excel(context: TenantAccessContext = Depends(require_role(Role.CLIENT))):
+    media_records = media_index_repository.list_media_index_records(context.db, context.tenant.id)
+    filename, file_bytes = import_service.build_media_export(media_records)
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(content=file_bytes, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
 
 
 @router.post("")
@@ -77,6 +87,34 @@ async def get_media_sync_status(
     job = media_service.get_media_sync_job(job_id)
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync job not found")
+    return success_response(job.model_dump())
+
+
+@router.post("/purge")
+async def start_media_purge(
+    confirm: str = "",
+    context: TenantAccessContext = Depends(require_role(Role.CLIENT)),
+):
+    if confirm != "BORRAR":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Falta confirmación. Envía confirm=BORRAR")
+    wp = _require_wp_credentials(context)
+    job = media_service.start_media_purge(
+        tenant_id=context.tenant.id,
+        wp_url=context.tenant.wc_url,
+        wp_user=wp["wp_user"],
+        wp_app_password=wp["wp_app_password"],
+    )
+    return success_response(job.model_dump(), status_code=202)
+
+
+@router.get("/purge/{job_id}")
+async def get_media_purge_status(
+    job_id: str,
+    context: TenantAccessContext = Depends(require_role(Role.CLIENT)),
+):
+    job = media_service.get_media_purge_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Purge job not found")
     return success_response(job.model_dump())
 
 

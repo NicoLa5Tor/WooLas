@@ -54,13 +54,15 @@ async def update_from_excel(*, file_bytes: bytes, id_column: str, value_column: 
     return summary.model_dump()
 
 
-async def list_products(*, page: int, search: str | None, products: list[dict]):
+async def list_products(*, page: int, search: str | None, products: list[dict], type_filter: str | None = None):
     filtered = products
+    if type_filter:
+        filtered = [p for p in filtered if str(p.get("type") or "") == type_filter]
     if search:
         term = search.strip().lower()
         filtered = [
             product
-            for product in products
+            for product in filtered
             if term in str(product.get("name", "")).lower()
             or term in str(product.get("sku", "")).lower()
             or term in str(product.get("slug", "")).lower()
@@ -151,6 +153,9 @@ def _build_wc_payload(payload: ProductCreate | ProductUpdate):
         values["downloads"] = _normalize_downloads(values["downloads"])
     if "meta_data" in values:
         values["meta_data"] = _normalize_meta_data(values["meta_data"])
+    # grouped_products only applies to type=grouped; strip for other types to avoid WC complaints
+    if values.get("type") and values.get("type") != "grouped":
+        values.pop("grouped_products", None)
 
     return values
 

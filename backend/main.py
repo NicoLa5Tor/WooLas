@@ -17,6 +17,7 @@ from routers import combos as combos_router
 from routers import imports as imports_router
 from routers import media as media_router
 from routers import products as products_router
+from routers import tenant_settings as tenant_settings_router
 from routers import tenants as tenants_router
 from routers import users as users_router
 from services import auth as auth_service
@@ -81,3 +82,4 @@ app.include_router(imports_router.router)
 app.include_router(products_router.router)
 app.include_router(products_router.catalog_router)
 app.include_router(combos_router.router)
+app.include_router(tenant_settings_router.router)

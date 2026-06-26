@@ -122,7 +122,7 @@ export function ProcessesProvider({ children }: { children: React.ReactNode }) {
       );
       for (const p of active) {
         try {
-          const res = await fetch(`/api${p.pollUrl}`, { credentials: "include", cache: "no-store" });
+          const res = await fetch(`/api/backend/api${p.pollUrl}`, { credentials: "include", cache: "no-store" });
           if (!res.ok) continue;
           const json = (await res.json()) as { data: Record<string, unknown> };
           const n = normalizeJob(p.type, json.data);

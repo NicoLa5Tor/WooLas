@@ -27,7 +27,8 @@ class WooCommerceService:
 
     async def _request(self, method: str, path: str = "", **kwargs):
         url = f"{self.wc_url}/{path.lstrip('/')}" if path else self.wc_url
-        async with httpx.AsyncClient(timeout=60.0, auth=self.auth) as client:
+        # Timeout largo (5 min) — batch_update con 25-100 productos puede tardar en WC servidores lentos
+        async with httpx.AsyncClient(timeout=300.0, auth=self.auth) as client:
             response = await client.request(method, url, **kwargs)
             response.raise_for_status()
             return response
@@ -157,6 +158,17 @@ class WooCommerceService:
                 params={"force": str(force).lower()},
             )
         ).json()
+
+    async def get_setting(self, group_id: str, setting_id: str) -> dict[str, Any]:
+        return (await self._request("GET", f"settings/{group_id}/{setting_id}")).json()
+
+    async def update_setting(self, group_id: str, setting_id: str, value: Any) -> dict[str, Any]:
+        return (
+            await self._request("PUT", f"settings/{group_id}/{setting_id}", json={"value": value})
+        ).json()
+
+    async def list_setting_group(self, group_id: str) -> list[dict[str, Any]]:
+        return (await self._request("GET", f"settings/{group_id}")).json()
 
     async def fetch_all_wp_media(self) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []

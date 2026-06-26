@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Boxes, DatabaseBackup, FileImage, FileSpreadsheet, LogOut, MoonStar, PackageSearch, ShieldCheck, SunMedium, X } from "lucide-react";
+import { Boxes, DatabaseBackup, FileImage, FileSpreadsheet, LogOut, MoonStar, PackageSearch, Settings, ShieldCheck, SunMedium, X } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useEffect, useState } from "react";
 
@@ -22,6 +22,7 @@ const items: Array<{
   { href: "/products", label: "Productos", icon: PackageSearch, roles: ["admin", "client"] },
   { href: "/combos", label: "Combos", icon: Boxes, roles: ["admin", "client"] },
   { href: "/imagenes", label: "Imágenes", icon: FileImage, roles: ["admin", "client"] },
+  { href: "/settings", label: "Configuración", icon: Settings, roles: ["admin", "client"] },
   { href: "/admin/users", label: "Clientes", icon: ShieldCheck, roles: ["admin"] }
 ];
 

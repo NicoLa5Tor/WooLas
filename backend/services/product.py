@@ -139,20 +139,49 @@ def _normalize_meta_data(meta_data: list[dict[str, Any]]):
 def _build_wc_payload(payload: ProductCreate | ProductUpdate):
     values = {key: value for key, value in payload.model_dump(exclude_none=True).items()}
 
+    # Safety pattern: arrays vacíos enviados a WC pueden borrar datos críticos
+    # (meta de plugins, categorías obligadas, imágenes que rompen theme, etc).
+    # Si el campo está vacío, lo quitamos para que WC mantenga lo que ya tenía.
+    # Para vaciar intencionalmente, hay que usar import Excel (flujo separado).
+
     if "images" in values:
-        values["images"] = _normalize_image_list(values["images"])
+        normalized = _normalize_image_list(values["images"])
+        if normalized:
+            values["images"] = normalized
+        else:
+            values.pop("images", None)
     if "categories" in values:
-        values["categories"] = _normalize_taxonomy_refs(values["categories"])
+        normalized = _normalize_taxonomy_refs(values["categories"])
+        if normalized:
+            values["categories"] = normalized
+        else:
+            values.pop("categories", None)
     if "tags" in values:
-        values["tags"] = _normalize_taxonomy_refs(values["tags"])
+        normalized = _normalize_taxonomy_refs(values["tags"])
+        if normalized:
+            values["tags"] = normalized
+        else:
+            values.pop("tags", None)
     if "attributes" in values:
-        values["attributes"] = _normalize_attributes(values["attributes"])
+        normalized = _normalize_attributes(values["attributes"])
+        if normalized:
+            values["attributes"] = normalized
+        else:
+            values.pop("attributes", None)
     if "dimensions" in values:
         values["dimensions"] = _normalize_dimensions(values["dimensions"])
     if "downloads" in values:
-        values["downloads"] = _normalize_downloads(values["downloads"])
+        normalized = _normalize_downloads(values["downloads"])
+        if normalized:
+            values["downloads"] = normalized
+        else:
+            values.pop("downloads", None)
     if "meta_data" in values:
-        values["meta_data"] = _normalize_meta_data(values["meta_data"])
+        normalized_meta = _normalize_meta_data(values["meta_data"])
+        if normalized_meta:
+            values["meta_data"] = normalized_meta
+        else:
+            values.pop("meta_data", None)
     # grouped_products only applies to type=grouped; strip for other types to avoid WC complaints
     if values.get("type") and values.get("type") != "grouped":
         values.pop("grouped_products", None)

@@ -15,7 +15,7 @@ from repositories import backup as backup_repository
 
 MAX_BACKUPS_PER_TENANT = 3
 MAX_BACKUP_AGE_HOURS = 2
-RESTORE_BATCH_SIZE = 100
+RESTORE_BATCH_SIZE = 25
 BACKUP_KIND_MANUAL = "manual"
 BACKUP_KIND_SAFETY_RESTORE = "safety_restore"
 BACKUP_KIND_RESTORED_STATE = "restored_state"
@@ -352,16 +352,33 @@ async def _run_restore_job(
                 job.current_product_name = str(chunk[0].get("name") or chunk[0].get("sku") or "")
 
             payload = [_build_restore_payload(p) for p in chunk]
-            response = await woo_service.batch_update(payload)
-            updated_items = response.get("update", [])
-            error_items = response.get("error", [])
-            job.updated += len(updated_items)
-            job.failed += len(error_items)
-            for item in error_items:
-                job.errors.append({
-                    "identifier": str(item.get("id") or item.get("sku") or "desconocido"),
-                    "error": item.get("error", "No se pudo restaurar"),
-                })
+            try:
+                response = await woo_service.batch_update(payload)
+                # WC batch errors come in "update" array as items with "code" field, NOT in "error"
+                update_items = response.get("update", [])
+                for item in update_items:
+                    if isinstance(item, dict) and "code" in item and "message" in item:
+                        identifier = str(item.get("data", {}).get("id") or item.get("id") or "desconocido")
+                        job.failed += 1
+                        job.errors.append({"identifier": identifier, "error": str(item.get("message"))[:200]})
+                    elif isinstance(item, dict) and item.get("id"):
+                        job.updated += 1
+                # Some WC versions also fill "error" array
+                for item in response.get("error", []):
+                    job.failed += 1
+                    job.errors.append({
+                        "identifier": str(item.get("id") or item.get("sku") or "desconocido"),
+                        "error": str(item.get("error") or item.get("message") or "No se pudo restaurar")[:200],
+                    })
+            except Exception as batch_exc:
+                # NO abortar todo el job — registrar todos los IDs del batch como fallidos
+                # y continuar con siguiente batch
+                job.failed += len(chunk)
+                for product in chunk:
+                    job.errors.append({
+                        "identifier": str(product.get("id") or product.get("sku") or "desconocido"),
+                        "error": f"Batch falló: {str(batch_exc)[:160]}",
+                    })
 
         job.progress = 100
         job.status = "completed"

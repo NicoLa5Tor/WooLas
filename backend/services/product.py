@@ -82,7 +82,20 @@ async def list_products(*, page: int, search: str | None, products: list[dict], 
     }
 
 
-async def get_product(*, product_id: int, products: list[dict]):
+async def get_product(*, product_id: int, products: list[dict], woo_service=None, backup_record=None, db=None):
+    # Fetch live de WooCommerce para evitar editar snapshot stale (stock vendido, meta de plugins).
+    # Si WC falla, fallback al backup como red de seguridad.
+    if woo_service is not None:
+        try:
+            live_product = await woo_service.get_product(product_id)
+            if live_product and live_product.get("id"):
+                if backup_record is not None and db is not None:
+                    backup_service.merge_products_into_backup(db, backup_record, [live_product])
+                    db.commit()
+                return live_product
+        except httpx.HTTPError:
+            pass
+
     product = next((item for item in products if int(item["id"]) == product_id), None)
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found in latest backup")
@@ -124,6 +137,9 @@ def _normalize_attributes(attributes: list[dict[str, Any]]):
             item["id"] = int(attribute["id"])
         if attribute.get("name"):
             item["name"] = str(attribute["name"])
+        # Conservar slug: para productos variable, variations enlazan atributos por slug.
+        if attribute.get("slug"):
+            item["slug"] = str(attribute["slug"])
         normalized.append(item)
     return normalized
 
@@ -137,52 +153,27 @@ def _normalize_meta_data(meta_data: list[dict[str, Any]]):
 
 
 def _build_wc_payload(payload: ProductCreate | ProductUpdate):
-    values = {key: value for key, value in payload.model_dump(exclude_none=True).items()}
-
-    # Safety pattern: arrays vacíos enviados a WC pueden borrar datos críticos
-    # (meta de plugins, categorías obligadas, imágenes que rompen theme, etc).
-    # Si el campo está vacío, lo quitamos para que WC mantenga lo que ya tenía.
-    # Para vaciar intencionalmente, hay que usar import Excel (flujo separado).
+    # Frontend manda solo campos modificados (diff). Si campo viene presente lo respetamos
+    # tal cual — array vacío significa "vaciar intencionalmente"; campo ausente = WC conserva.
+    values = {key: value for key, value in payload.model_dump(exclude_unset=True).items()}
 
     if "images" in values:
-        normalized = _normalize_image_list(values["images"])
-        if normalized:
-            values["images"] = normalized
-        else:
-            values.pop("images", None)
+        values["images"] = _normalize_image_list(values["images"])
     if "categories" in values:
-        normalized = _normalize_taxonomy_refs(values["categories"])
-        if normalized:
-            values["categories"] = normalized
-        else:
-            values.pop("categories", None)
+        values["categories"] = _normalize_taxonomy_refs(values["categories"])
     if "tags" in values:
-        normalized = _normalize_taxonomy_refs(values["tags"])
-        if normalized:
-            values["tags"] = normalized
-        else:
-            values.pop("tags", None)
+        values["tags"] = _normalize_taxonomy_refs(values["tags"])
     if "attributes" in values:
-        normalized = _normalize_attributes(values["attributes"])
-        if normalized:
-            values["attributes"] = normalized
-        else:
-            values.pop("attributes", None)
+        values["attributes"] = _normalize_attributes(values["attributes"])
     if "dimensions" in values:
         values["dimensions"] = _normalize_dimensions(values["dimensions"])
     if "downloads" in values:
-        normalized = _normalize_downloads(values["downloads"])
-        if normalized:
-            values["downloads"] = normalized
-        else:
-            values.pop("downloads", None)
+        values["downloads"] = _normalize_downloads(values["downloads"])
     if "meta_data" in values:
-        normalized_meta = _normalize_meta_data(values["meta_data"])
-        if normalized_meta:
-            values["meta_data"] = normalized_meta
-        else:
-            values.pop("meta_data", None)
-    # grouped_products only applies to type=grouped; strip for other types to avoid WC complaints
+        # WC REST hace upsert por key; claves ausentes se conservan. Frontend ya filtra solo
+        # entries editados, así que no tocamos meta de plugins no-modificada.
+        values["meta_data"] = _normalize_meta_data(values["meta_data"])
+    # grouped_products solo aplica a type=grouped; strip si tipo distinto está presente.
     if values.get("type") and values.get("type") != "grouped":
         values.pop("grouped_products", None)
 
@@ -190,7 +181,7 @@ def _build_wc_payload(payload: ProductCreate | ProductUpdate):
 
 
 def _build_variation_payload(payload: ProductVariationCreate | ProductVariationUpdate):
-    values = {key: value for key, value in payload.model_dump(exclude_none=True).items()}
+    values = {key: value for key, value in payload.model_dump(exclude_unset=True).items()}
     if "dimensions" in values:
         values["dimensions"] = _normalize_dimensions(values["dimensions"])
     if "image" in values and values["image"] is not None:

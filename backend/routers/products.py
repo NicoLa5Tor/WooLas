@@ -158,7 +158,16 @@ async def delete_variation(
 
 @router.get("/{product_id}")
 async def get_product(product_id: int, context: TenantAccessContext = Depends(require_recent_backup(Role.CLIENT))):
-    return success_response(await product_service.get_product(product_id=product_id, products=context.backup_record.payload))
+    woo_service = WooCommerceService(**context.credentials)
+    return success_response(
+        await product_service.get_product(
+            product_id=product_id,
+            products=context.backup_record.payload,
+            woo_service=woo_service,
+            backup_record=context.backup_record,
+            db=context.db,
+        )
+    )
 
 
 @router.put("/{product_id}")

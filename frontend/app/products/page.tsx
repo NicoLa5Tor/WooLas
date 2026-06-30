@@ -3,7 +3,7 @@
 import { useSearchParams } from "next/navigation";
 import { Copy, Download, ExternalLink, ImagePlus, LoaderCircle, PackageSearch, Plus, Search, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 
 import { MediaLibraryBrowser } from "@/components/MediaLibraryBrowser";
 import { Badge } from "@/components/ui/badge";
@@ -459,7 +459,15 @@ function toEditorVariation(variation: any): ProductVariation {
   };
 }
 
-function buildPayload(product: EditorProduct) {
+function jsonEq(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function clone<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function buildFullProductPayload(product: EditorProduct) {
   return {
     name: product.name.trim(),
     slug: product.slug.trim() || null,
@@ -504,12 +512,43 @@ function buildPayload(product: EditorProduct) {
     cross_sell_ids: product.cross_sell_ids,
     downloads: product.downloads.filter((item) => item.name.trim() && item.file.trim()),
     download_limit: product.download_limit.trim() ? Number(product.download_limit) : null,
-    download_expiry: product.download_expiry.trim() ? Number(product.download_expiry) : null,
-    meta_data: product.meta_data.filter((item) => item.key.trim()).map((item) => ({ key: item.key.trim(), value: item.value }))
-  };
+    download_expiry: product.download_expiry.trim() ? Number(product.download_expiry) : null
+  } as Record<string, any>;
 }
 
-function buildVariationPayload(variation: ProductVariation) {
+function buildPayload(product: EditorProduct, original: EditorProduct | null) {
+  const current = buildFullProductPayload(product);
+  if (!original) {
+    // Create: enviar payload completo + meta editado
+    const editedMeta = product.meta_data.filter((item) => item.key.trim()).map((item) => ({ key: item.key.trim(), value: item.value }));
+    if (editedMeta.length > 0) {
+      current.meta_data = editedMeta;
+    }
+    return current;
+  }
+  const orig = buildFullProductPayload(original);
+  const diff: Record<string, any> = {};
+  for (const key of Object.keys(current)) {
+    if (!jsonEq(current[key], orig[key])) {
+      diff[key] = current[key];
+    }
+  }
+  // meta_data: solo enviamos entries editados (WC upsert preserva otras keys → meta de plugins intacta)
+  const editedMeta = product.meta_data
+    .filter((item) => {
+      const trimmedKey = item.key.trim();
+      if (!trimmedKey) return false;
+      const origItem = original.meta_data.find((m) => m.key === item.key);
+      return !origItem || origItem.value !== item.value;
+    })
+    .map((item) => ({ key: item.key.trim(), value: item.value }));
+  if (editedMeta.length > 0) {
+    diff.meta_data = editedMeta;
+  }
+  return diff;
+}
+
+function buildFullVariationPayload(variation: ProductVariation) {
   return {
     sku: variation.sku.trim() || null,
     regular_price: variation.regular_price.trim() || null,
@@ -529,9 +568,38 @@ function buildVariationPayload(variation: ProductVariation) {
     downloadable: variation.downloadable,
     downloads: variation.downloads.filter((item) => item.name.trim() && item.file.trim()),
     download_limit: variation.download_limit.trim() ? Number(variation.download_limit) : null,
-    download_expiry: variation.download_expiry.trim() ? Number(variation.download_expiry) : null,
-    meta_data: variation.meta_data.filter((item) => item.key.trim()).map((item) => ({ key: item.key.trim(), value: item.value }))
-  };
+    download_expiry: variation.download_expiry.trim() ? Number(variation.download_expiry) : null
+  } as Record<string, any>;
+}
+
+function buildVariationPayload(variation: ProductVariation, original: ProductVariation | null) {
+  const current = buildFullVariationPayload(variation);
+  if (!original) {
+    const editedMeta = variation.meta_data.filter((item) => item.key.trim()).map((item) => ({ key: item.key.trim(), value: item.value }));
+    if (editedMeta.length > 0) {
+      current.meta_data = editedMeta;
+    }
+    return current;
+  }
+  const orig = buildFullVariationPayload(original);
+  const diff: Record<string, any> = {};
+  for (const key of Object.keys(current)) {
+    if (!jsonEq(current[key], orig[key])) {
+      diff[key] = current[key];
+    }
+  }
+  const editedMeta = variation.meta_data
+    .filter((item) => {
+      const trimmedKey = item.key.trim();
+      if (!trimmedKey) return false;
+      const origItem = original.meta_data.find((m) => m.key === item.key);
+      return !origItem || origItem.value !== item.value;
+    })
+    .map((item) => ({ key: item.key.trim(), value: item.value }));
+  if (editedMeta.length > 0) {
+    diff.meta_data = editedMeta;
+  }
+  return diff;
 }
 
 function Section({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
@@ -584,6 +652,9 @@ export default function ProductsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedProduct, setSelectedProduct] = useState<EditorProduct | null>(null);
+  const [originalProduct, setOriginalProduct] = useState<EditorProduct | null>(null);
+  const [originalVariations, setOriginalVariations] = useState<Record<number, ProductVariation>>({});
+  const [quickStockBusyId, setQuickStockBusyId] = useState<number | null>(null);
   const [editorMode, setEditorMode] = useState<"create" | "edit">("edit");
   const [activeTab, setActiveTab] = useState<TabKey>("general");
   const [panelLoading, setPanelLoading] = useState(false);
@@ -669,7 +740,15 @@ export default function ProductsPage() {
     setVariationsLoading(true);
     try {
       const response = await apiRequest<any[]>(withTenantPath(activeTenant.id, `/products/${productId}/variations`), { cache: "no-store" });
-      setVariations(response.data.map(toEditorVariation));
+      const editorVariations = response.data.map(toEditorVariation);
+      setVariations(editorVariations);
+      const originals: Record<number, ProductVariation> = {};
+      for (const variation of editorVariations) {
+        if (variation.id) {
+          originals[variation.id] = clone(variation);
+        }
+      }
+      setOriginalVariations(originals);
     } catch (err) {
       showToast(err instanceof Error ? err.message : "No se pudieron cargar las variaciones", "error");
     } finally {
@@ -720,6 +799,8 @@ export default function ProductsPage() {
         setActiveTab("general");
         setPanelLoading(false);
         setVariations([]);
+        setOriginalVariations({});
+        setOriginalProduct(null);
         setSelectedProduct(nextProduct);
         window.sessionStorage.removeItem("woolas.import.prefill");
       } catch {
@@ -759,6 +840,7 @@ export default function ProductsPage() {
       const response = await apiRequest<Product>(withTenantPath(activeTenant.id, `/products/${productId}`), { cache: "no-store" });
       const product = toEditorProduct(response.data);
       setSelectedProduct(product);
+      setOriginalProduct(clone(product));
       if (product.type === "variable") {
         await loadVariations(productId);
       }
@@ -774,6 +856,8 @@ export default function ProductsPage() {
     setActiveTab("general");
     setPanelLoading(false);
     setVariations([]);
+    setOriginalVariations({});
+    setOriginalProduct(null);
     setSelectedProduct(emptyProduct());
   };
 
@@ -783,6 +867,10 @@ export default function ProductsPage() {
     }
     if (!selectedProduct.name.trim()) {
       showToast("El nombre del producto es obligatorio", "error");
+      return;
+    }
+    if (selectedProduct.manage_stock && selectedProduct.stock_quantity.trim() === "") {
+      showToast("Gestionar stock activado: ingresa una cantidad o desactiva la opción", "error");
       return;
     }
 
@@ -806,12 +894,20 @@ export default function ProductsPage() {
       if (selectedProduct.images.length > 0) {
         setSaveOperationStatus(`Guardando imágenes de ${selectedProduct.name.trim()} por Media ID...`);
       }
+      const diffPayload = buildPayload(productToSave, editorMode === "edit" ? originalProduct : null);
+      if (editorMode === "edit" && Object.keys(diffPayload).length === 0) {
+        showToast("No hay cambios para guardar");
+        setSaveOperationProgress(100);
+        setSaveOperationStatus("Sin cambios");
+        return;
+      }
       const response = editorMode === "create"
-        ? await apiRequest<Product>(withTenantPath(activeTenant.id, "/products"), { method: "POST", body: JSON.stringify(buildPayload(productToSave)) })
-        : await apiRequest<Product>(withTenantPath(activeTenant.id, `/products/${selectedProduct.id}`), { method: "PUT", body: JSON.stringify(buildPayload(productToSave)) });
+        ? await apiRequest<Product>(withTenantPath(activeTenant.id, "/products"), { method: "POST", body: JSON.stringify(diffPayload) })
+        : await apiRequest<Product>(withTenantPath(activeTenant.id, `/products/${selectedProduct.id}`), { method: "PUT", body: JSON.stringify(diffPayload) });
 
       const product = toEditorProduct(response.data);
       setSelectedProduct(product);
+      setOriginalProduct(clone(product));
       setEditorMode("edit");
       if (product.type === "variable" && response.data.id) {
         await loadVariations(response.data.id);
@@ -852,6 +948,9 @@ export default function ProductsPage() {
       await apiRequest(withTenantPath(activeTenant.id, `/products/${selectedProduct.id}?force=true`), { method: "DELETE" });
       showToast(`${name} eliminado`);
       setSelectedProduct(null);
+      setOriginalProduct(null);
+      setOriginalVariations({});
+      setVariations([]);
       await loadProducts(session ?? undefined);
     } catch (err) {
       showToast(err instanceof Error ? err.message : "No se pudo eliminar", "error");
@@ -962,17 +1061,70 @@ export default function ProductsPage() {
     setVariations((current) => [...current, emptyVariation()]);
   };
 
+  const quickToggleStock = async (productId: number, nextStatus: StockStatus, event: ReactMouseEvent) => {
+    event.stopPropagation();
+    if (!activeTenant) {
+      return;
+    }
+    setQuickStockBusyId(productId);
+    try {
+      // WC autocalcula stock_status desde stock_quantity cuando manage_stock=true.
+      // Sin stock: forzamos manage_stock=true + stock_quantity=0 para que el tema muestre "0 disponibles" / agotado.
+      // Con stock: si gestionaba stock alineamos cantidad >=1; si no, solo cambiamos estado.
+      const sourceProduct = products.find((item) => item.id === productId)
+        ?? (selectedProduct?.id === productId ? {
+              manage_stock: selectedProduct.manage_stock,
+              stock_quantity: selectedProduct.stock_quantity === "" ? null : Number(selectedProduct.stock_quantity),
+            } : null);
+      const payload: Record<string, any> = { stock_status: nextStatus };
+      if (nextStatus === "outofstock") {
+        payload.manage_stock = true;
+        payload.stock_quantity = 0;
+      } else if (sourceProduct?.manage_stock) {
+        payload.stock_quantity = Math.max(1, Number(sourceProduct.stock_quantity ?? 0) || 1);
+      }
+      const response = await apiRequest<Product>(
+        withTenantPath(activeTenant.id, `/products/${productId}`),
+        { method: "PUT", body: JSON.stringify(payload) }
+      );
+      setProducts((current) => current.map((item) => item.id === productId ? { ...item, stock_status: response.data.stock_status, manage_stock: response.data.manage_stock, stock_quantity: response.data.stock_quantity } : item));
+      if (selectedProduct?.id === productId) {
+        const refreshed = toEditorProduct(response.data);
+        setSelectedProduct(refreshed);
+        setOriginalProduct(clone(refreshed));
+      }
+      showToast(nextStatus === "outofstock" ? "Producto marcado sin stock" : "Producto marcado con stock");
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "No se pudo cambiar el stock", "error");
+    } finally {
+      setQuickStockBusyId(null);
+    }
+  };
+
   const saveVariation = async (variation: ProductVariation, index: number) => {
     if (!activeTenant || !selectedProduct?.id) {
       return;
     }
+    if (variation.manage_stock && variation.stock_quantity.trim() === "") {
+      showToast("Gestionar stock activado: ingresa cantidad para la variación", "error");
+      return;
+    }
     setVariationSavingIndex(index);
     try {
+      const originalVariation = variation.id ? originalVariations[variation.id] ?? null : null;
+      const diffPayload = buildVariationPayload(variation, originalVariation);
+      if (variation.id && Object.keys(diffPayload).length === 0) {
+        showToast("Sin cambios en la variación");
+        return;
+      }
       const response = variation.id
-        ? await apiRequest<any>(withTenantPath(activeTenant.id, `/products/${selectedProduct.id}/variations/${variation.id}`), { method: "PUT", body: JSON.stringify(buildVariationPayload(variation)) })
-        : await apiRequest<any>(withTenantPath(activeTenant.id, `/products/${selectedProduct.id}/variations`), { method: "POST", body: JSON.stringify(buildVariationPayload(variation)) });
-      setVariations((current) => current.map((item, itemIndex) => itemIndex === index ? toEditorVariation(response.data) : item));
-      await openProduct(selectedProduct.id, true);
+        ? await apiRequest<any>(withTenantPath(activeTenant.id, `/products/${selectedProduct.id}/variations/${variation.id}`), { method: "PUT", body: JSON.stringify(diffPayload) })
+        : await apiRequest<any>(withTenantPath(activeTenant.id, `/products/${selectedProduct.id}/variations`), { method: "POST", body: JSON.stringify(diffPayload) });
+      const updated = toEditorVariation(response.data);
+      setVariations((current) => current.map((item, itemIndex) => itemIndex === index ? updated : item));
+      if (updated.id) {
+        setOriginalVariations((current) => ({ ...current, [updated.id!]: clone(updated) }));
+      }
       showToast(variation.id ? "Variación actualizada" : "Variación creada");
     } catch (err) {
       showToast(err instanceof Error ? err.message : "No se pudo guardar la variación", "error");
@@ -993,6 +1145,14 @@ export default function ProductsPage() {
     try {
       await apiRequest(withTenantPath(activeTenant.id, `/products/${selectedProduct.id}/variations/${variation.id}`), { method: "DELETE" });
       setVariations((current) => current.filter((_, itemIndex) => itemIndex !== index));
+      const deletedId = variation.id;
+      if (deletedId) {
+        setOriginalVariations((current) => {
+          const next = { ...current };
+          delete next[deletedId];
+          return next;
+        });
+      }
       await openProduct(selectedProduct.id, true);
       showToast("Variación eliminada");
     } catch (err) {
@@ -1045,25 +1205,41 @@ export default function ProductsPage() {
           {!loading && !error && activeTenant ? (
             <>
               <div className="grid gap-4 md:hidden">
-                {products.map((product) => (
-                  <button key={product.id} className="rounded-2xl border border-border bg-background/70 p-4 text-left transition-colors hover:border-primary/40 hover:bg-accent/20" onClick={() => void openProduct(product.id)} type="button">
-                    <div className="flex gap-4">
-                      <div className="h-16 w-16 shrink-0 overflow-hidden rounded-xl bg-accent">
-                        {product.images?.[0]?.src ? <img alt={product.name} className="h-full w-full object-cover" src={product.images[0].src} /> : null}
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="font-medium">{product.name}</div>
-                        <div className="mt-1 text-sm text-muted-foreground">SKU: {product.sku || "-"}</div>
-                        <div className="mt-1 text-sm text-muted-foreground line-clamp-2">{stripHtml(product.short_description || product.description) || "Sin descripción"}</div>
-                        <div className="mt-3 flex flex-wrap gap-2 text-xs text-muted-foreground">
-                          <span className="rounded-full bg-accent px-2.5 py-1">Precio: {displayPrice(product)}</span>
-                          <span className="rounded-full bg-accent px-2.5 py-1">{product.type}</span>
+                {products.map((product) => {
+                  const isOutOfStock = product.stock_status === "outofstock";
+                  const busy = quickStockBusyId === product.id;
+                  return (
+                    <div key={product.id} className="rounded-2xl border border-border bg-background/70 p-4 transition-colors hover:border-primary/40 hover:bg-accent/20">
+                      <button className="block w-full text-left" onClick={() => void openProduct(product.id)} type="button">
+                        <div className="flex gap-4">
+                          <div className="h-16 w-16 shrink-0 overflow-hidden rounded-xl bg-accent">
+                            {product.images?.[0]?.src ? <img alt={product.name} className="h-full w-full object-cover" src={product.images[0].src} /> : null}
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <div className="font-medium">{product.name}</div>
+                            <div className="mt-1 text-sm text-muted-foreground">SKU: {product.sku || "-"}</div>
+                            <div className="mt-1 text-sm text-muted-foreground line-clamp-2">{stripHtml(product.short_description || product.description) || "Sin descripción"}</div>
+                            <div className="mt-3 flex flex-wrap gap-2 text-xs text-muted-foreground">
+                              <span className="rounded-full bg-accent px-2.5 py-1">Precio: {displayPrice(product)}</span>
+                              <span className="rounded-full bg-accent px-2.5 py-1">{product.type}</span>
+                            </div>
+                          </div>
+                          <Badge>{product.status}</Badge>
                         </div>
+                      </button>
+                      <div className="mt-3">
+                        <Button
+                          className="h-9 w-full rounded-lg text-xs"
+                          disabled={busy}
+                          onClick={(event) => void quickToggleStock(product.id, isOutOfStock ? "instock" : "outofstock", event)}
+                          variant={isOutOfStock ? "secondary" : "outline"}
+                        >
+                          {busy ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : isOutOfStock ? "Marcar con stock" : "Marcar sin stock"}
+                        </Button>
                       </div>
-                      <Badge>{product.status}</Badge>
                     </div>
-                  </button>
-                ))}
+                  );
+                })}
                 {products.length === 0 ? <div className="rounded-2xl border border-border bg-background/70 px-4 py-6 text-sm text-muted-foreground">No hay productos para esta búsqueda.</div> : null}
               </div>
 
@@ -1078,21 +1254,36 @@ export default function ProductsPage() {
                       <th className="px-4 py-3 text-left font-medium">Precio</th>
                       <th className="px-4 py-3 text-left font-medium">Stock</th>
                       <th className="px-4 py-3 text-left font-medium">Estado</th>
+                      <th className="px-4 py-3 text-left font-medium">Acciones</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border bg-card">
-                    {products.map((product) => (
-                      <tr key={product.id} className="cursor-pointer hover:bg-accent/40" onClick={() => void openProduct(product.id)}>
-                        <td className="px-4 py-3"><div className="relative h-12 w-12 overflow-hidden rounded-md bg-accent">{product.images?.[0]?.src ? <img alt={product.name} className="h-full w-full object-cover" src={product.images[0].src} /> : null}</div></td>
-                        <td className="px-4 py-3"><div className="font-medium">{product.name}</div><div className="text-xs text-muted-foreground">{product.categories?.map((category) => category.name).join(", ") || "Sin categoría"}</div></td>
-                        <td className="px-4 py-3">{product.sku || "-"}</td>
-                        <td className="px-4 py-3">{product.type}</td>
-                        <td className="px-4 py-3">{displayPrice(product)}</td>
-                        <td className="px-4 py-3">{product.manage_stock ? product.stock_quantity ?? 0 : product.stock_status}</td>
-                        <td className="px-4 py-3"><Badge>{product.status}</Badge></td>
-                      </tr>
-                    ))}
-                    {products.length === 0 ? <tr><td className="px-4 py-6 text-muted-foreground" colSpan={7}>No hay productos para esta búsqueda.</td></tr> : null}
+                    {products.map((product) => {
+                      const isOutOfStock = product.stock_status === "outofstock";
+                      const busy = quickStockBusyId === product.id;
+                      return (
+                        <tr key={product.id} className="cursor-pointer hover:bg-accent/40" onClick={() => void openProduct(product.id)}>
+                          <td className="px-4 py-3"><div className="relative h-12 w-12 overflow-hidden rounded-md bg-accent">{product.images?.[0]?.src ? <img alt={product.name} className="h-full w-full object-cover" src={product.images[0].src} /> : null}</div></td>
+                          <td className="px-4 py-3"><div className="font-medium">{product.name}</div><div className="text-xs text-muted-foreground">{product.categories?.map((category) => category.name).join(", ") || "Sin categoría"}</div></td>
+                          <td className="px-4 py-3">{product.sku || "-"}</td>
+                          <td className="px-4 py-3">{product.type}</td>
+                          <td className="px-4 py-3">{displayPrice(product)}</td>
+                          <td className="px-4 py-3">{product.manage_stock ? product.stock_quantity ?? 0 : product.stock_status}</td>
+                          <td className="px-4 py-3"><Badge>{product.status}</Badge></td>
+                          <td className="px-4 py-3">
+                            <Button
+                              className="h-8 rounded-lg px-3 text-xs"
+                              disabled={busy}
+                              onClick={(event) => void quickToggleStock(product.id, isOutOfStock ? "instock" : "outofstock", event)}
+                              variant={isOutOfStock ? "secondary" : "outline"}
+                            >
+                              {busy ? <LoaderCircle className="h-3.5 w-3.5 animate-spin" /> : isOutOfStock ? "Marcar con stock" : "Marcar sin stock"}
+                            </Button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {products.length === 0 ? <tr><td className="px-4 py-6 text-muted-foreground" colSpan={8}>No hay productos para esta búsqueda.</td></tr> : null}
                   </tbody>
                 </table>
               </div>
@@ -1111,7 +1302,7 @@ export default function ProductsPage() {
 
       {selectedProduct ? (
         <>
-          <div className="fixed inset-0 z-40 bg-slate-950/55 backdrop-blur-sm" onClick={() => setSelectedProduct(null)} />
+          <div className="fixed inset-0 z-40 bg-slate-950/55 backdrop-blur-sm" onClick={() => { setSelectedProduct(null); setOriginalProduct(null); setOriginalVariations({}); setVariations([]); }} />
           <div className="fixed inset-y-0 right-0 z-50 w-full max-w-6xl overflow-y-auto border-l border-border bg-card p-5 shadow-2xl sm:p-6">
             <div className="mb-5 flex items-start justify-between gap-4">
               <div>
@@ -1122,7 +1313,7 @@ export default function ProductsPage() {
                   {loadingReferences ? <Badge className="border border-border bg-background text-foreground">Cargando referencias...</Badge> : null}
                 </div>
               </div>
-              <button className="rounded-xl p-2 hover:bg-accent" onClick={() => setSelectedProduct(null)} type="button"><X className="h-5 w-5" /></button>
+              <button className="rounded-xl p-2 hover:bg-accent" onClick={() => { setSelectedProduct(null); setOriginalProduct(null); setOriginalVariations({}); setVariations([]); }} type="button"><X className="h-5 w-5" /></button>
             </div>
 
             {panelLoading ? <div className="text-sm text-muted-foreground">Cargando producto...</div> : null}
@@ -1192,6 +1383,24 @@ export default function ProductsPage() {
 
                     {activeTab === "inventory" ? (
                       <Section title="Inventario" description="Control de stock, backorders y alertas.">
+                        {selectedProduct.id ? (
+                          <div className="flex flex-col gap-2 rounded-xl border border-dashed border-primary/40 bg-primary/5 p-3 sm:flex-row sm:items-center sm:justify-between">
+                            <div className="text-sm">
+                              <div className="font-medium">Acción rápida</div>
+                              <div className="text-muted-foreground">Cambia solo el estado de stock sin tocar otros campos.</div>
+                            </div>
+                            <Button
+                              className="h-10 rounded-xl"
+                              disabled={quickStockBusyId === selectedProduct.id}
+                              onClick={(event) => selectedProduct.id && void quickToggleStock(selectedProduct.id, selectedProduct.stock_status === "outofstock" ? "instock" : "outofstock", event)}
+                              variant={selectedProduct.stock_status === "outofstock" ? "secondary" : "outline"}
+                              type="button"
+                            >
+                              {quickStockBusyId === selectedProduct.id ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : null}
+                              {selectedProduct.stock_status === "outofstock" ? "Marcar con stock" : "Marcar sin stock"}
+                            </Button>
+                          </div>
+                        ) : null}
                         <div className="grid gap-4 md:grid-cols-2">
                           <div className="space-y-2"><label className="text-sm font-medium">Estado de stock</label><Select value={selectedProduct.stock_status} onValueChange={(value) => updateSelectedProduct({ ...selectedProduct, stock_status: value as StockStatus })}><SelectTrigger className="h-12 rounded-xl"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="instock">In stock</SelectItem><SelectItem value="outofstock">Out of stock</SelectItem><SelectItem value="onbackorder">On backorder</SelectItem></SelectContent></Select></div>
                           <div className="space-y-2"><label className="text-sm font-medium">Backorders</label><Select value={selectedProduct.backorders} onValueChange={(value) => updateSelectedProduct({ ...selectedProduct, backorders: value as BackordersStatus })}><SelectTrigger className="h-12 rounded-xl"><SelectValue /></SelectTrigger><SelectContent><SelectItem value="no">No</SelectItem><SelectItem value="notify">Notify</SelectItem><SelectItem value="yes">Yes</SelectItem></SelectContent></Select></div>

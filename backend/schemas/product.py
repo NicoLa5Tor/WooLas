@@ -30,6 +30,7 @@ class ProductDimensionsInput(BaseModel):
 class ProductAttributeInput(BaseModel):
     id: int | None = None
     name: str | None = None
+    slug: str | None = None
     position: int = 0
     visible: bool = True
     variation: bool = False
